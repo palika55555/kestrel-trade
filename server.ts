@@ -468,7 +468,18 @@ interface ForexFactoryRawEvent {
   previous?: string;
 }
 
-const SERVER_BOT_STATE_PATH = path.join(process.cwd(), '.kestrel-server-bot.json');
+const SERVER_BOOT_ID = `boot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+const HAS_PERSISTENT_VOLUME = Boolean(
+  (process.env.KESTREL_DATA_DIR && fs.existsSync(process.env.KESTREL_DATA_DIR)) ||
+    fs.existsSync('/data'),
+);
+const SERVER_DATA_DIR =
+  process.env.KESTREL_DATA_DIR && fs.existsSync(process.env.KESTREL_DATA_DIR)
+    ? process.env.KESTREL_DATA_DIR
+    : fs.existsSync('/data')
+    ? '/data'
+    : process.cwd();
+const SERVER_BOT_STATE_PATH = path.join(SERVER_DATA_DIR, '.kestrel-server-bot.json');
 
 function createServerBotDefaultConfig(): XauBotConfig {
   return {
@@ -553,6 +564,8 @@ class LiveMarketEngine {
   private serverBotLastTradeAt = 0;
   private serverBotLastHoldLogAt = 0;
   private brokerOrderInFlight = false;
+  private swissquoteInFlight = false;
+  private yahooInFlight = false;
   private brokerCache: {
     balance: number | null;
     equity: number | null;
@@ -888,7 +901,10 @@ class LiveMarketEngine {
   }
 
   private async pollSwissquoteAndKraken() {
-    const swissSeeds = SEEDS.filter((s) => s.swissquotePair);
+    if (this.swissquoteInFlight) return;
+    this.swissquoteInFlight = true;
+    try {
+      const swissSeeds = SEEDS.filter((s) => s.swissquotePair);
     await Promise.all([
       ...swissSeeds.map(async (seed) => {
         const data = await fetchJsonWithTimeout<SwissquoteQuote[]>(
@@ -1002,8 +1018,17 @@ class LiveMarketEngine {
       })(),
     ]);
 
-    this.evaluateServerBotTick();
+    try {
+      this.evaluateServerBotTick();
+    } catch (err) {
+      console.error('[bot] evaluateServerBotTick error:', err);
+    }
     this.broadcastTick();
+    } catch (err) {
+      console.error('[feed] pollSwissquoteAndKraken error:', err);
+    } finally {
+      this.swissquoteInFlight = false;
+    }
   }
 
   private evaluateServerBotTick() {
@@ -1817,6 +1842,41 @@ class LiveMarketEngine {
     return this.getServerBotState();
   }
 
+  restoreServerBotState(payload: Partial<ServerBotState>): ServerBotState {
+    // Only restore if this server instance is completely clean/freshly booted
+    const serverIsClean =
+      !this.serverBot.enabled &&
+      this.serverBot.positions.length === 0 &&
+      this.serverBot.closedTrades.length === 0 &&
+      this.serverBot.executions.length === 0 &&
+      this.serverBot.lastEvaluatedAt === 0;
+    if (!serverIsClean) {
+      return this.getServerBotState();
+    }
+    const now = Date.now();
+    this.serverBot = {
+      enabled: Boolean(payload.enabled),
+      config: {
+        ...createServerBotDefaultConfig(),
+        ...(payload.config || {}),
+        enabled: Boolean(payload.enabled),
+      },
+      positions: Array.isArray(payload.positions) ? payload.positions.slice(0, 20) : [],
+      closedTrades: Array.isArray(payload.closedTrades) ? payload.closedTrades.slice(0, 200) : [],
+      executions: Array.isArray(payload.executions) ? payload.executions.slice(0, 200) : [],
+      logs: Array.isArray(payload.logs) ? payload.logs.slice(0, 80) : [],
+      netPnl: typeof payload.netPnl === 'number' ? payload.netPnl : 0,
+      lastEvaluatedAt: now,
+      brokerRoutingArmed: Boolean(payload.brokerRoutingArmed),
+    };
+    this.appendServerBotLog(
+      'INFO',
+      `Restored ${this.serverBot.positions.length} open / ${this.serverBot.closedTrades.length} closed trades after server restart.`,
+    );
+    this.persistServerBotState();
+    return this.getServerBotState();
+  }
+
   getServerBotState(): ServerBotState {
     const xau = this.instruments.get('XAU/USD');
     const realizedNet = this.serverBot.closedTrades.reduce((a, t) => a + t.netPnl, 0);
@@ -1832,6 +1892,8 @@ class LiveMarketEngine {
       netPnl: roundToDecimals(realizedNet + unrealNet, 2),
       brokerStatus: this.getBrokerStatus(),
       machineId: process.env.FLY_MACHINE_ID || process.env.HOSTNAME || 'local',
+      bootId: SERVER_BOOT_ID,
+      storagePersistent: HAS_PERSISTENT_VOLUME,
     };
   }
 
@@ -2022,8 +2084,11 @@ class LiveMarketEngine {
   }
 
   private async pollYahooQuotes() {
-    const yahooSeeds = SEEDS.filter((s) => s.yahooSymbol && !s.swissquotePair);
-    const fxYahooSeeds = SEEDS.filter((s) => s.yahooSymbol && s.swissquotePair);
+    if (this.yahooInFlight) return;
+    this.yahooInFlight = true;
+    try {
+      const yahooSeeds = SEEDS.filter((s) => s.yahooSymbol && !s.swissquotePair);
+      const fxYahooSeeds = SEEDS.filter((s) => s.yahooSymbol && s.swissquotePair);
 
     await Promise.all([
       ...yahooSeeds.map(async (seed) => {
@@ -2103,7 +2168,12 @@ class LiveMarketEngine {
       })(),
     ]);
 
-    this.broadcastTick();
+      this.broadcastTick();
+    } catch (err) {
+      console.error('[feed] pollYahooQuotes error:', err);
+    } finally {
+      this.yahooInFlight = false;
+    }
   }
 
   async fetchLiveCandles(symbol: string, timeframe: Timeframe): Promise<Candle[]> {
@@ -2354,6 +2424,10 @@ async function startServer() {
     res.json(engine.resetServerBotState());
   });
 
+  app.post('/api/bot/restore', (req, res) => {
+    res.json(engine.restoreServerBotState(req.body || {}));
+  });
+
   app.get('/api/broker/status', (_req, res) => {
     res.json(engine.getBrokerStatus());
   });
@@ -2462,6 +2536,10 @@ async function startServer() {
     process.exit(1);
   });
 }
+
+process.on('uncaughtException', (err) => {
+  console.error('[runtime] Uncaught exception:', err);
+});
 
 process.on('unhandledRejection', (reason) => {
   console.error('[runtime] Unhandled promise rejection:', reason);

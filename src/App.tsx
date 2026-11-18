@@ -342,6 +342,7 @@ export default function App() {
   const server247EnabledRef = useRef(server247Enabled);
   server247EnabledRef.current = server247Enabled;
   const seenMachineIdsRef = useRef<Set<string>>(new Set());
+  const restoredBootIdsRef = useRef<Set<string>>(new Set());
   const botMutationStampRef = useRef<number>(0);
   const userChoseBrowserModeRef = useRef<boolean>(false);
   const xauBotLastTradeRef = useRef<number>(0);
@@ -464,24 +465,25 @@ export default function App() {
     };
   }, [isOnline, instruments.length]);
 
-  // Connect to Real-Time SSE Market Stream when online
+  // Connect to Real-Time SSE Market Stream when online (with automatic HTTP/2 fallback to /api/markets)
   useEffect(() => {
     if (!isOnline) {
       setStreamConnected(false);
       return;
     }
 
-    const es = new EventSource('/api/stream');
-    es.onopen = () => setStreamConnected(true);
-    es.onerror = () => setStreamConnected(false);
+    let cancelled = false;
+    let es: EventSource | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let retrySseTimer: ReturnType<typeof setTimeout> | null = null;
+    let consecutiveSseErrors = 0;
 
-    es.onmessage = (event) => {
+    const processMarketTick = (payload: {
+      type?: string;
+      timestamp: number;
+      instruments: Instrument[];
+    }) => {
       try {
-        const payload = JSON.parse(event.data) as {
-          type: string;
-          timestamp: number;
-          instruments: Instrument[];
-        };
         if (!payload.instruments?.length) return;
 
         setStreamConnected(true);
@@ -1316,8 +1318,82 @@ export default function App() {
       }
     };
 
+    const startHttpFallback = () => {
+      if (cancelled || pollTimer) return;
+      const pullOnce = async () => {
+        if (cancelled) return;
+        try {
+          const res = await fetch('/api/markets');
+          if (!res.ok) return;
+          const data = (await res.json()) as {
+            timestamp: number;
+            instruments: Instrument[];
+          };
+          if (!cancelled) processMarketTick(data);
+        } catch {
+          if (!cancelled) setStreamConnected(false);
+        }
+      };
+      void pullOnce();
+      pollTimer = setInterval(pullOnce, 1800);
+    };
+
+    const stopHttpFallback = () => {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+
+    const connectSse = () => {
+      if (cancelled) return;
+      es?.close();
+      es = new EventSource('/api/stream');
+      es.onopen = () => {
+        consecutiveSseErrors = 0;
+        stopHttpFallback();
+        if (!cancelled) setStreamConnected(true);
+      };
+      es.onmessage = (event) => {
+        consecutiveSseErrors = 0;
+        stopHttpFallback();
+        try {
+          const payload = JSON.parse(event.data) as {
+            type: string;
+            timestamp: number;
+            instruments: Instrument[];
+          };
+          processMarketTick(payload);
+        } catch {
+          // Ignore malformed SSE JSON frame
+        }
+      };
+      es.onerror = () => {
+        consecutiveSseErrors += 1;
+        if (consecutiveSseErrors >= 2) {
+          es?.close();
+          es = null;
+          startHttpFallback();
+          if (!retrySseTimer && !cancelled) {
+            retrySseTimer = setTimeout(() => {
+              retrySseTimer = null;
+              consecutiveSseErrors = 0;
+              connectSse();
+            }, 30_000);
+          }
+        } else {
+          if (!cancelled) setStreamConnected(false);
+        }
+      };
+    };
+
+    connectSse();
+
     return () => {
-      es.close();
+      cancelled = true;
+      es?.close();
+      stopHttpFallback();
+      if (retrySseTimer) clearTimeout(retrySseTimer);
       setStreamConnected(false);
     };
   }, [isOnline, emitNotification, appendBotLog, recordClosedBotTradesAndLearn]);
@@ -1563,10 +1639,13 @@ export default function App() {
     };
   }, [isOnline]);
 
-  // Poll 24/7 Server Bot state & reconnect automatically if running on backend
+  // Poll 24/7 Server Bot state, back up state locally, and auto-recover if ephemeral Fly disk restarts blank
   useEffect(() => {
     if (!isOnline) return;
     let cancelled = false;
+    const BACKUP_KEY = 'kestrel-server-bot-backup';
+    const RESET_KEY = 'kestrel-server-bot-reset-at';
+
     const pullBotState = async () => {
       try {
         const res = await fetch('/api/bot/state');
@@ -1583,12 +1662,90 @@ export default function App() {
         if (Date.now() - botMutationStampRef.current < 1500) {
           return;
         }
+
+        const serverIsBlank =
+          !data.enabled &&
+          data.positions.length === 0 &&
+          data.closedTrades.length === 0 &&
+          data.executions.length === 0 &&
+          data.lastEvaluatedAt === 0;
+
+        if (
+          serverIsBlank &&
+          seenMachineIdsRef.current.size <= 1 &&
+          data.bootId &&
+          !restoredBootIdsRef.current.has(data.bootId)
+        ) {
+          restoredBootIdsRef.current.add(data.bootId);
+          try {
+            const rawBackup = localStorage.getItem(BACKUP_KEY);
+            const resetAt = Number(localStorage.getItem(RESET_KEY) || '0');
+            if (rawBackup) {
+              const parsed = JSON.parse(rawBackup) as {
+                savedAt: number;
+                state: ServerBotState;
+              };
+              const st = parsed?.state;
+              const hasActivity = Boolean(
+                st &&
+                  (st.enabled ||
+                    st.positions.length > 0 ||
+                    st.closedTrades.length > 0 ||
+                    st.executions.length > 0),
+              );
+              if (hasActivity && parsed.savedAt > resetAt) {
+                botMutationStampRef.current = Date.now();
+                const restoreRes = await fetch('/api/bot/restore', {
+                  method: 'POST',
+                  headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify(st),
+                });
+                if (restoreRes.ok && !cancelled) {
+                  const restored = (await restoreRes.json()) as ServerBotState;
+                  botMutationStampRef.current = Date.now();
+                  setServerBotState(restored);
+                  if (restored.brokerStatus) {
+                    setBrokerStatus(restored.brokerStatus);
+                  }
+                  if (restored.enabled && !userChoseBrowserModeRef.current) {
+                    setServer247Enabled(true);
+                  }
+                  emitNotification(
+                    '24/7 Bot Auto-Restored',
+                    `Server restarted — restored ${restored.positions.length} open & ${restored.closedTrades.length} closed trades automatically.`,
+                    'SYSTEM',
+                  );
+                  return;
+                }
+              }
+            }
+          } catch {
+            // Ignore malformed backup
+          }
+        }
+
         setServerBotState(data);
         if (data.brokerStatus) {
           setBrokerStatus(data.brokerStatus);
         }
         if (data.enabled && !userChoseBrowserModeRef.current) {
           setServer247Enabled(true);
+        }
+
+        if (
+          data.enabled ||
+          data.positions.length > 0 ||
+          data.closedTrades.length > 0 ||
+          data.executions.length > 0
+        ) {
+          try {
+            localStorage.setItem(
+              BACKUP_KEY,
+              JSON.stringify({savedAt: Date.now(), state: data}),
+            );
+          } catch {
+            // Ignore quota errors
+          }
         }
       } catch {
         // Ignore transient network errors
@@ -1600,7 +1757,7 @@ export default function App() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [isOnline]);
+  }, [isOnline, emitNotification]);
 
   // Acquire Browser Screen Wake Lock while Browser Bot runs so device doesn't sleep
   useEffect(() => {
@@ -2168,6 +2325,13 @@ export default function App() {
     setNotifications([]);
     setXauBotConfig((prev) => ({...prev, enabled: false}));
     setServer247Enabled(false);
+
+    try {
+      localStorage.removeItem('kestrel-server-bot-backup');
+      localStorage.setItem('kestrel-server-bot-reset-at', String(Date.now()));
+    } catch {
+      // Ignore storage error
+    }
 
     try {
       const res = await fetch('/api/bot/reset', {method: 'POST'});
