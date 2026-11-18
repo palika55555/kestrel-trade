@@ -1,0 +1,6 @@
+{
+  "name": "Kestrel Trade",
+  "description": "Institutional CFD and Futures trading workstation with real-time market data, advanced charting, risk management, biometric security, end-of-day reporting, and offline PWA portfolio access.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
