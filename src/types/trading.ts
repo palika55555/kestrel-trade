@@ -505,7 +505,14 @@ export interface ServerBotState {
   closedTrades: XauBotTradeRecord[];
   executions: TradeExecution[];
   logs: XauBotLogEntry[];
+  /** All-time P&L (realized across all days + open positions). */
   netPnl: number;
+  /** Today's P&L (Europe/Bratislava day), used for the daily loss limit. */
+  dailyPnl?: number;
+  /** Realized P&L of trades that fell out of the 200-trade history. */
+  archivedRealizedPnl?: number;
+  /** Day (YYYY-MM-DD) the bot was paused by the daily loss limit; it resumes the next day. */
+  dailyLossPausedDay?: string;
   lastEvaluatedAt: number;
   brokerRoutingArmed?: boolean;
   brokerStatus?: BrokerStatus;

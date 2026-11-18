@@ -1129,8 +1129,13 @@ export default function App() {
             const botOpenPositions = activePositionsNow.filter(
               (p) => p.symbol === 'XAU/USD' && p.source === 'XAU_BOT',
             );
+            // Daily loss limit: only today's closed trades count.
+            const today = new Date().toDateString();
             const botClosedExecs = executionsRef.current.filter(
-              (e) => e.source === 'XAU_BOT' && e.action !== 'OPEN',
+              (e) =>
+                e.source === 'XAU_BOT' &&
+                e.action !== 'OPEN' &&
+                new Date(e.timestamp).toDateString() === today,
             );
             const botRealized = botClosedExecs.reduce(
               (acc, e) => acc + e.realizedPnl - e.fee,

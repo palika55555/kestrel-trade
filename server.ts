@@ -280,6 +280,12 @@ function roundToDecimals(value: number, decimals: number): number {
   return Math.round(value * factor) / factor;
 }
 
+const bratislavaDayFormat = new Intl.DateTimeFormat('sv-SE', {timeZone: 'Europe/Bratislava'});
+// YYYY-MM-DD of a timestamp in Slovak time; the daily loss limit resets at local midnight.
+function bratislavaDay(ts: number): string {
+  return bratislavaDayFormat.format(ts);
+}
+
 function buildSyntheticOrderBook(
   bid: number,
   ask: number,
@@ -665,11 +671,44 @@ class LiveMarketEngine {
           netPnl: typeof parsed.netPnl === 'number' ? parsed.netPnl : 0,
           lastEvaluatedAt: parsed.lastEvaluatedAt || 0,
           brokerRoutingArmed: Boolean(parsed.brokerRoutingArmed),
+          archivedRealizedPnl: typeof parsed.archivedRealizedPnl === 'number' ? parsed.archivedRealizedPnl : 0,
+          dailyLossPausedDay: parsed.dailyLossPausedDay,
         };
       }
     } catch {
       // Ignore corrupt persisted bot file
     }
+  }
+
+  // Keeps the last 200 trades; P&L of trades that fall off is kept in archivedRealizedPnl so the all-time total stays correct.
+  private capClosedTrades(trades: XauBotTradeRecord[]): XauBotTradeRecord[] {
+    const dropped = trades.slice(200).reduce((a, t) => a + t.netPnl, 0);
+    if (dropped !== 0) {
+      this.serverBot.archivedRealizedPnl = roundToDecimals((this.serverBot.archivedRealizedPnl || 0) + dropped, 2);
+    }
+    return trades.slice(0, 200);
+  }
+
+  // Returns { total: all-time realized + unrealized, daily: today's realized + unrealized }; the day is Europe/Bratislava.
+  private computeServerBotPnl(xau: Instrument | undefined) {
+    const today = bratislavaDay(Date.now());
+    let realizedAll = this.serverBot.archivedRealizedPnl || 0;
+    let realizedToday = 0;
+    for (const t of this.serverBot.closedTrades) {
+      realizedAll += t.netPnl;
+      if (bratislavaDay(t.closedAt) === today) realizedToday += t.netPnl;
+    }
+    const unreal = xau
+      ? this.serverBot.positions.reduce((a, p) => {
+          const m = p.side === 'BUY' ? xau.bid : xau.ask;
+          const d = p.side === 'BUY' ? m - p.entryPrice : p.entryPrice - m;
+          return a + d * p.quantity * xau.contractSize;
+        }, 0)
+      : 0;
+    return {
+      total: roundToDecimals(realizedAll + unreal, 2),
+      daily: roundToDecimals(realizedToday + unreal, 2),
+    };
   }
 
   private persistServerBotState() {
@@ -1032,6 +1071,15 @@ class LiveMarketEngine {
   }
 
   private evaluateServerBotTick() {
+    // A pause caused by the daily loss limit ends at the next Slovak midnight.
+    const pausedDay = this.serverBot.dailyLossPausedDay;
+    if (!this.serverBot.enabled && pausedDay && pausedDay !== bratislavaDay(Date.now())) {
+      this.serverBot.enabled = true;
+      this.serverBot.config.enabled = true;
+      this.serverBot.dailyLossPausedDay = undefined;
+      this.appendServerBotLog('INFO', 'New trading day: daily loss reset to $0, bot resumed.');
+      this.persistServerBotState();
+    }
     if (!this.serverBot.enabled) return;
     const xau = this.instruments.get('XAU/USD');
     if (!xau || xau.price <= 0) return;
@@ -1086,7 +1134,7 @@ class LiveMarketEngine {
             const gross = roundToDecimals(diff * closeQty * xau.contractSize, 2);
             const fee = roundToDecimals(closeQty * xau.commissionPerUnit * 2, 2);
             const net = roundToDecimals(gross - fee, 2);
-            this.serverBot.closedTrades = [
+            this.serverBot.closedTrades = this.capClosedTrades([
               {
                 id: `sbtr-${now}-p`,
                 positionId: `${cur.id}-ptp`,
@@ -1107,7 +1155,7 @@ class LiveMarketEngine {
                 closedAt: now,
               },
               ...this.serverBot.closedTrades,
-            ].slice(0, 200);
+            ]);
             cur.quantity = remQty;
             cur.partialTpTaken = true;
             cur.breakEvenMoved = true;
@@ -1136,7 +1184,7 @@ class LiveMarketEngine {
         const gross = roundToDecimals(diff * cur.quantity * xau.contractSize, 2);
         const fee = roundToDecimals(cur.quantity * xau.commissionPerUnit * 2, 2);
         const net = roundToDecimals(gross - fee, 2);
-        this.serverBot.closedTrades = [
+        this.serverBot.closedTrades = this.capClosedTrades([
           {
             id: `sbtr-${now}-${Math.random().toString(36).slice(2, 5)}`,
             positionId: cur.id,
@@ -1157,7 +1205,7 @@ class LiveMarketEngine {
             closedAt: now,
           },
           ...this.serverBot.closedTrades,
-        ].slice(0, 200);
+        ]);
         this.serverBot.executions = [
           {
             id: `sbex-${now}`,
@@ -1183,18 +1231,15 @@ class LiveMarketEngine {
     this.serverBot.positions = remaining;
 
     // 2. Check Drawdown Circuit Breaker
-    const realizedNet = this.serverBot.closedTrades.reduce((a, t) => a + t.netPnl, 0);
-    const unrealNet = this.serverBot.positions.reduce((a, p) => {
-      const m = p.side === 'BUY' ? xau.bid : xau.ask;
-      const d = p.side === 'BUY' ? m - p.entryPrice : p.entryPrice - m;
-      return a + d * p.quantity * xau.contractSize;
-    }, 0);
-    this.serverBot.netPnl = roundToDecimals(realizedNet + unrealNet, 2);
+    const pnl = this.computeServerBotPnl(xau);
+    this.serverBot.netPnl = pnl.total;
+    this.serverBot.dailyPnl = pnl.daily;
 
-    if (this.serverBot.netPnl <= -Math.abs(cfg.maxDailyLossDollars)) {
+    if (pnl.daily <= -Math.abs(cfg.maxDailyLossDollars)) {
       this.serverBot.enabled = false;
       this.serverBot.config.enabled = false;
-      this.appendServerBotLog('RISK', `Paused: max daily loss ($${cfg.maxDailyLossDollars}) reached.`);
+      this.serverBot.dailyLossPausedDay = bratislavaDay(now);
+      this.appendServerBotLog('RISK', `Paused until tomorrow: max daily loss ($${cfg.maxDailyLossDollars}) reached.`);
       this.persistServerBotState();
       return;
     }
@@ -1868,6 +1913,7 @@ class LiveMarketEngine {
       netPnl: typeof payload.netPnl === 'number' ? payload.netPnl : 0,
       lastEvaluatedAt: now,
       brokerRoutingArmed: Boolean(payload.brokerRoutingArmed),
+      archivedRealizedPnl: typeof payload.archivedRealizedPnl === 'number' ? payload.archivedRealizedPnl : 0,
     };
     this.appendServerBotLog(
       'INFO',
@@ -1878,18 +1924,11 @@ class LiveMarketEngine {
   }
 
   getServerBotState(): ServerBotState {
-    const xau = this.instruments.get('XAU/USD');
-    const realizedNet = this.serverBot.closedTrades.reduce((a, t) => a + t.netPnl, 0);
-    const unrealNet = xau
-      ? this.serverBot.positions.reduce((a, p) => {
-          const m = p.side === 'BUY' ? xau.bid : xau.ask;
-          const d = p.side === 'BUY' ? m - p.entryPrice : p.entryPrice - m;
-          return a + d * p.quantity * xau.contractSize;
-        }, 0)
-      : 0;
+    const pnl = this.computeServerBotPnl(this.instruments.get('XAU/USD'));
     return {
       ...this.serverBot,
-      netPnl: roundToDecimals(realizedNet + unrealNet, 2),
+      netPnl: pnl.total,
+      dailyPnl: pnl.daily,
       brokerStatus: this.getBrokerStatus(),
       machineId: process.env.FLY_MACHINE_ID || process.env.HOSTNAME || 'local',
       bootId: SERVER_BOOT_ID,
@@ -1907,6 +1946,8 @@ class LiveMarketEngine {
     merged.enabled = nowEnabled;
     this.serverBot.config = merged;
     this.serverBot.enabled = nowEnabled;
+    // A manual on/off overrides the automatic resume after a daily-loss pause.
+    if (next.enabled !== undefined) this.serverBot.dailyLossPausedDay = undefined;
     if (wasEnabled !== nowEnabled) {
       this.appendServerBotLog(
         'INFO',
@@ -1930,7 +1971,7 @@ class LiveMarketEngine {
         const gross = roundToDecimals(diff * pos.quantity * xau.contractSize, 2);
         const fee = roundToDecimals(pos.quantity * xau.commissionPerUnit * 2, 2);
         const net = roundToDecimals(gross - fee, 2);
-        this.serverBot.closedTrades = [
+        this.serverBot.closedTrades = this.capClosedTrades([
           {
             id: `sbtr-${now}-${Math.random().toString(36).slice(2, 5)}`,
             positionId: pos.id,
@@ -1951,7 +1992,7 @@ class LiveMarketEngine {
             closedAt: now,
           },
           ...this.serverBot.closedTrades,
-        ].slice(0, 200);
+        ]);
         this.serverBot.executions = [
           {
             id: `sbex-close-${now}-${Math.random().toString(36).slice(2, 5)}`,
@@ -2016,7 +2057,7 @@ class LiveMarketEngine {
       }
     }
 
-    this.serverBot.closedTrades = [
+    this.serverBot.closedTrades = this.capClosedTrades([
       {
         id: `sbtr-${now}-${Math.random().toString(36).slice(2, 5)}`,
         positionId: actualFraction >= 0.999 ? pos.id : `${pos.id}-p`,
@@ -2037,7 +2078,7 @@ class LiveMarketEngine {
         closedAt: now,
       },
       ...this.serverBot.closedTrades,
-    ].slice(0, 200);
+    ]);
 
     this.serverBot.executions = [
       {

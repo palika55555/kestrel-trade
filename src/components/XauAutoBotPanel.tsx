@@ -85,7 +85,13 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
   const losses = closedBotExecs.filter((e) => e.realizedPnl < 0).length;
   const winRate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
 
-  const circuitBreakerHit = netPnl <= -Math.abs(config.maxDailyLossDollars);
+  // Daily limit counts only today's closed trades (+ open positions); netPnl above stays all-time.
+  const today = new Date().toDateString();
+  const dailyPnl =
+    closedBotExecs
+      .filter((e) => new Date(e.timestamp).toDateString() === today)
+      .reduce((a, e) => a + e.realizedPnl - e.fee, 0) + unrealizedPnl;
+  const circuitBreakerHit = dailyPnl <= -Math.abs(config.maxDailyLossDollars);
 
   return (
     <div className="bg-white dark:bg-[#121721] border border-slate-200 dark:border-[#1E2636] rounded-xl p-4 space-y-4">
