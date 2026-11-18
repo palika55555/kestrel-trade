@@ -1,12 +1,18 @@
-import React, {useMemo} from 'react';
-import {Database, Shield, Wifi, WifiOff} from 'lucide-react';
+import React, {useMemo, useState} from 'react';
+import {Database, RotateCcw, Shield, Wifi, WifiOff} from 'lucide-react';
+import {BrokerConnectionCard} from './BrokerConnectionCard';
 import {
   computePositionNotional,
   computeUnrealizedPnl,
   formatCurrency,
   formatPrice,
 } from '../services/tradingMath';
-import type {Instrument, Position, RiskSettings} from '../types/trading';
+import type {
+  BrokerStatus,
+  Instrument,
+  Position,
+  RiskSettings,
+} from '../types/trading';
 
 interface PortfolioViewProps {
   cashBalance: number;
@@ -23,6 +29,10 @@ interface PortfolioViewProps {
   lastSyncedAt: number;
   isOnline: boolean;
   onSelectSymbolAndTrade: (symbol: string) => void;
+  brokerStatus: BrokerStatus | null;
+  onSyncBroker: () => Promise<void>;
+  onToggleBrokerRouting: (armed: boolean) => Promise<void>;
+  onResetAccount: (startingBalance: number) => Promise<void>;
 }
 
 const CLASS_COLORS: Record<string, string> = {
@@ -56,7 +66,13 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
   lastSyncedAt,
   isOnline,
   onSelectSymbolAndTrade,
+  brokerStatus,
+  onSyncBroker,
+  onToggleBrokerRouting,
+  onResetAccount,
 }) => {
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetBalance, setResetBalance] = useState(10000);
   const dailyPnl = equity - dayStartEquity;
   const dailyPnlPct = dayStartEquity > 0 ? (dailyPnl / dayStartEquity) * 100 : 0;
   const dailyDrawdownPct = dailyPnl < 0 ? Math.abs(dailyPnlPct) : 0;
@@ -106,6 +122,60 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
 
   return (
     <div className="space-y-5">
+      {/* Header Clean Reset Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="font-display text-lg font-bold text-slate-900 dark:text-white">
+            Portfolio, Risk &amp; Real Broker Execution
+          </h1>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Monitor exposure, reset paper balances to zero history, or connect an external OANDA / MT4 / MT5 broker
+          </p>
+        </div>
+
+        {!confirmReset ? (
+          <button
+            type="button"
+            onClick={() => setConfirmReset(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Reset Clean Account</span>
+          </button>
+        ) : (
+          <div className="inline-flex items-center gap-2 rounded-lg border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5">
+            <select
+              value={resetBalance}
+              onChange={(e) => setResetBalance(Number(e.target.value))}
+              className="bg-transparent text-xs font-mono text-slate-900 dark:text-white outline-none"
+              aria-label="Starting clean balance"
+            >
+              <option value={1000} className="bg-slate-900">$1,000</option>
+              <option value={10000} className="bg-slate-900">$10,000</option>
+              <option value={25000} className="bg-slate-900">$25,000</option>
+              <option value={100000} className="bg-slate-900">$100,000</option>
+            </select>
+            <button
+              type="button"
+              onClick={async () => {
+                await onResetAccount(resetBalance);
+                setConfirmReset(false);
+              }}
+              className="px-2.5 py-1 rounded bg-rose-600 text-white text-xs font-semibold hover:bg-rose-700 cursor-pointer"
+            >
+              Confirm Reset
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmReset(false)}
+              className="px-1.5 py-1 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
+
       {/* Top 4-column Summary Strip */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5">
         <SummaryMetric
@@ -134,6 +204,14 @@ export const PortfolioView: React.FC<PortfolioViewProps> = ({
           positive={usedMargin === 0 || marginLevelPct > riskSettings.marginCallLevelPct}
         />
       </div>
+
+      {/* Real Broker Execution Bridge */}
+      <BrokerConnectionCard
+        brokerStatus={brokerStatus}
+        isOnline={isOnline}
+        onSyncBroker={onSyncBroker}
+        onToggleRouting={onToggleBrokerRouting}
+      />
 
       {/* Allocation + Risk Guardrails Split */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">

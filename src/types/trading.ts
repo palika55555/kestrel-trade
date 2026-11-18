@@ -79,6 +79,8 @@ export interface Position {
   botConfidence?: number;
   breakEvenMoved?: boolean;
   partialTpTaken?: boolean;
+  brokerOrderId?: string;
+  brokerProvider?: BrokerProvider;
 }
 
 export interface PendingOrder {
@@ -477,6 +479,25 @@ export interface EconomicCalendarSnapshot {
   updatedAt: number;
 }
 
+export type BrokerProvider = 'SIMULATION' | 'OANDA' | 'METAAPI' | 'WEBHOOK';
+
+export interface BrokerStatus {
+  provider: BrokerProvider;
+  configured: boolean;
+  environment: 'practice' | 'live';
+  routingArmed: boolean;
+  accountLabel: string;
+  currency: string;
+  balance: number | null;
+  equity: number | null;
+  unrealizedPnl: number | null;
+  marginUsed: number | null;
+  openPositionsCount: number;
+  lastSyncedAt: number | null;
+  lastOrderSummary: string | null;
+  lastError: string | null;
+}
+
 export interface ServerBotState {
   enabled: boolean;
   config: XauBotConfig;
@@ -486,6 +507,8 @@ export interface ServerBotState {
   logs: XauBotLogEntry[];
   netPnl: number;
   lastEvaluatedAt: number;
+  brokerRoutingArmed?: boolean;
+  brokerStatus?: BrokerStatus;
 }
 
 export type ActiveTab = 'trade' | 'bot' | 'portfolio' | 'alerts' | 'reports' | 'security';

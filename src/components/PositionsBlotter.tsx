@@ -149,7 +149,12 @@ export const PositionsBlotter: React.FC<PositionsBlotterProps> = ({
                           {pos.symbol}
                         </button>
                         <span className="ml-1.5 text-[11px] font-normal text-slate-400">
-                          {pos.leverage}x{pos.source === 'XAU_BOT' ? ' · Bot' : ''}
+                          {pos.leverage}x
+                          {pos.source === 'XAU_BOT'
+                            ? pos.id.startsWith('sbpos-')
+                              ? ' · 24/7 Bot'
+                              : ' · Bot'
+                            : ''}
                         </span>
                       </td>
                       <td className="py-2 px-3 whitespace-nowrap">

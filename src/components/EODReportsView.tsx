@@ -1,17 +1,21 @@
 import React, {useMemo, useState} from 'react';
-import {Download, FileCheck2} from 'lucide-react';
+import {Download, FileCheck2, RotateCcw} from 'lucide-react';
 import {formatCurrency} from '../services/tradingMath';
 import type {EODReport} from '../types/trading';
 
 interface EODReportsViewProps {
   reports: EODReport[];
   onGenerateTodayReport: () => void;
+  onResetAccount: (startingBalance: number) => Promise<void>;
 }
 
 export const EODReportsView: React.FC<EODReportsViewProps> = ({
   reports,
   onGenerateTodayReport,
+  onResetAccount,
 }) => {
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [startingCap, setStartingCap] = useState(10000);
   const [range, setRange] = useState<'7D' | '14D' | 'ALL'>('ALL');
   const [selectedReportId, setSelectedReportId] = useState<string | null>(
     reports[0]?.id || null,
@@ -178,6 +182,48 @@ export const EODReportsView: React.FC<EODReportsViewProps> = ({
             <Download className="w-3.5 h-3.5" />
             <span>Export CSV</span>
           </button>
+
+          {!confirmReset ? (
+            <button
+              type="button"
+              onClick={() => setConfirmReset(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset Clean Data</span>
+            </button>
+          ) : (
+            <div className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 px-2 py-1">
+              <select
+                value={startingCap}
+                onChange={(e) => setStartingCap(Number(e.target.value))}
+                className="bg-transparent text-xs font-mono text-slate-900 dark:text-white outline-none"
+                aria-label="Starting balance"
+              >
+                <option value={1000} className="bg-slate-900">$1,000</option>
+                <option value={10000} className="bg-slate-900">$10,000</option>
+                <option value={25000} className="bg-slate-900">$25,000</option>
+                <option value={100000} className="bg-slate-900">$100,000</option>
+              </select>
+              <button
+                type="button"
+                onClick={async () => {
+                  await onResetAccount(startingCap);
+                  setConfirmReset(false);
+                }}
+                className="px-2 py-0.5 rounded bg-rose-600 text-white text-[11px] font-semibold hover:bg-rose-700 cursor-pointer"
+              >
+                Confirm Wipe
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmReset(false)}
+                className="px-1.5 py-0.5 text-[11px] text-slate-500 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -339,7 +385,17 @@ export const EODReportsView: React.FC<EODReportsViewProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-[#1A2130] text-xs">
-              {visibleReports.map((r) => {
+              {visibleReports.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={8}
+                    className="py-8 text-center text-xs text-slate-500 dark:text-slate-400"
+                  >
+                    Clean ledger — no settled EOD sessions yet. Trade or click &quot;Close Today&apos;s EOD&quot; after closing trades.
+                  </td>
+                </tr>
+              ) : (
+                visibleReports.map((r) => {
                 const active = selectedReport?.id === r.id;
                 return (
                   <tr
@@ -391,7 +447,7 @@ export const EODReportsView: React.FC<EODReportsViewProps> = ({
                     </td>
                   </tr>
                 );
-              })}
+              }))}
             </tbody>
           </table>
         </div>

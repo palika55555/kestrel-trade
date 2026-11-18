@@ -18,6 +18,7 @@ import {
 import {computeUnrealizedPnl, formatCurrency, formatPrice} from '../services/tradingMath';
 import type {XauBotEvaluation} from '../services/xauBot';
 import type {
+  BrokerStatus,
   Instrument,
   Position,
   TradeExecution,
@@ -45,6 +46,8 @@ interface XauAutoBotPanelProps {
   onCloseBotPositions: () => void;
   onClearLogs: () => void;
   onOpenStats?: () => void;
+  brokerStatus?: BrokerStatus | null;
+  onOpenBrokerSettings?: () => void;
 }
 
 export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
@@ -66,6 +69,8 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
   onCloseBotPositions,
   onClearLogs,
   onOpenStats,
+  brokerStatus,
+  onOpenBrokerSettings,
 }) => {
   const closedBotExecs = botExecutions.filter((e) => e.action !== 'OPEN');
   const realizedPnl = closedBotExecs.reduce((a, e) => a + e.realizedPnl - e.fee, 0);
@@ -113,9 +118,27 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
                   </span>
                 </>
               )}
+              {onOpenBrokerSettings && (
+                <>
+                  <span className="text-xs text-slate-400">·</span>
+                  <button
+                    type="button"
+                    onClick={onOpenBrokerSettings}
+                    className={`text-[11px] font-semibold cursor-pointer hover:underline ${
+                      brokerStatus?.routingArmed
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-blue-600 dark:text-blue-400'
+                    }`}
+                  >
+                    {brokerStatus?.routingArmed
+                      ? `Live Broker: ${brokerStatus.provider}`
+                      : 'Paper Mode · Connect Broker'}
+                  </button>
+                </>
+              )}
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Autonomous paper-trading bot executing Long/Short XAU/USD positions with automated SL/TP on real-time quotes.
+              Autonomous XAU/USD bot executing Long/Short positions on live quotes (Paper or Real Broker via OANDA / MT4 / MT5).
             </p>
           </div>
         </div>

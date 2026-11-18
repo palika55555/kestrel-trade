@@ -40,6 +40,7 @@ import {analyzeOrderFlow} from './services/orderFlowAnalyzer';
 import {
   computeRequiredMargin,
   computeUnrealizedPnl,
+  createCleanAccountState,
   createDefaultRiskSettings,
   createDefaultSecurityState,
   createInitialSeedState,
@@ -55,6 +56,7 @@ import {
 import type {
   ActiveTab,
   AlertNotification,
+  BrokerStatus,
   Candle,
   ChartDrawing,
   EconomicCalendarSnapshot,
@@ -152,6 +154,7 @@ export default function App() {
   const [calendarSnapshot, setCalendarSnapshot] = useState<EconomicCalendarSnapshot | null>(null);
   const [server247Enabled, setServer247Enabled] = useState<boolean>(false);
   const [serverBotState, setServerBotState] = useState<ServerBotState | null>(null);
+  const [brokerStatus, setBrokerStatus] = useState<BrokerStatus | null>(null);
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
   const [candlesBySymbol, setCandlesBySymbol] = useState<Record<string, Candle[]>>({});
   const [stagedOrderPreset, setStagedOrderPreset] = useState<StagedOrderPreset | null>(null);
@@ -1423,6 +1426,27 @@ export default function App() {
     [server247Enabled, serverBotState, xauBotTrades],
   );
 
+  const allPositions = useMemo(() => {
+    const sbPositions = serverBotState?.positions || [];
+    if (sbPositions.length === 0) return positions;
+    const seen = new Set(sbPositions.map((p) => p.id));
+    return [...sbPositions, ...positions.filter((p) => !seen.has(p.id))];
+  }, [serverBotState, positions]);
+
+  const allExecutions = useMemo(() => {
+    const sbExecs = serverBotState?.executions || [];
+    if (sbExecs.length === 0) return executions;
+    const seen = new Set<string>();
+    const combined: TradeExecution[] = [];
+    for (const ex of [...sbExecs, ...executions]) {
+      if (!seen.has(ex.id)) {
+        seen.add(ex.id);
+        combined.push(ex);
+      }
+    }
+    return combined.sort((a, b) => b.timestamp - a.timestamp);
+  }, [serverBotState, executions]);
+
   // Poll real live Time & Sales prints & liquidity feed for selected symbol (and XAU/USD for the bot)
   useEffect(() => {
     if (!isOnline) return;
@@ -1546,6 +1570,9 @@ export default function App() {
         const data = (await res.json()) as ServerBotState;
         if (cancelled) return;
         setServerBotState(data);
+        if (data.brokerStatus) {
+          setBrokerStatus(data.brokerStatus);
+        }
         if (data.enabled) {
           setServer247Enabled(true);
         }
@@ -1674,15 +1701,15 @@ export default function App() {
 
   // Live Account Metrics
   const unrealizedPnl = useMemo(() => {
-    return positions.reduce((sum, pos) => {
+    return allPositions.reduce((sum, pos) => {
       const inst = instrumentsMap.get(pos.symbol);
       return sum + (inst ? computeUnrealizedPnl(pos, inst) : 0);
     }, 0);
-  }, [positions, instrumentsMap]);
+  }, [allPositions, instrumentsMap]);
 
   const usedMargin = useMemo(
-    () => positions.reduce((sum, p) => sum + p.marginUsed, 0),
-    [positions],
+    () => allPositions.reduce((sum, p) => sum + p.marginUsed, 0),
+    [allPositions],
   );
 
   const equity = cashBalance + unrealizedPnl;
@@ -1827,7 +1854,34 @@ export default function App() {
     });
   };
 
-  const handleClosePosition = (positionId: string, fraction = 1) => {
+  const handleClosePosition = async (positionId: string, fraction = 1) => {
+    const serverPos = serverBotState?.positions.find((p) => p.id === positionId);
+    if (serverPos || positionId.startsWith('sbpos-')) {
+      try {
+        const res = await fetch(`/api/bot/close/${encodeURIComponent(positionId)}`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({fraction}),
+        });
+        if (res.ok) {
+          const updated = (await res.json()) as ServerBotState;
+          setServerBotState(updated);
+          if (serverPos) {
+            emitNotification(
+              `Closed ${serverPos.symbol}`,
+              `24/7 Bot ${serverPos.side} ${fraction >= 1 ? serverPos.quantity : '50%'} closed`,
+              'EXECUTION',
+              serverPos.symbol,
+              'fill',
+            );
+          }
+        }
+      } catch {
+        // Ignore transient network errors
+      }
+      return;
+    }
+
     const pos = positions.find((p) => p.id === positionId);
     if (!pos) return;
     const inst = instrumentsMap.get(pos.symbol);
@@ -1928,15 +1982,43 @@ export default function App() {
     );
   };
 
-  const handleFlattenAll = () => {
-    positions.forEach((p) => handleClosePosition(p.id, 1));
+  const handleFlattenAll = async () => {
+    positions.forEach((p) => void handleClosePosition(p.id, 1));
+    if ((serverBotState?.positions.length ?? 0) > 0) {
+      try {
+        const res = await fetch('/api/bot/close-all', {method: 'POST'});
+        if (res.ok) {
+          setServerBotState((await res.json()) as ServerBotState);
+        }
+      } catch {
+        // Ignore transient network errors
+      }
+    }
   };
 
-  const handleUpdatePositionRisk = (
+  const handleUpdatePositionRisk = async (
     positionId: string,
     stopLoss: number | null,
     takeProfit: number | null,
   ) => {
+    if (
+      serverBotState?.positions.some((p) => p.id === positionId) ||
+      positionId.startsWith('sbpos-')
+    ) {
+      try {
+        const res = await fetch(`/api/bot/risk/${encodeURIComponent(positionId)}`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({stopLoss, takeProfit}),
+        });
+        if (res.ok) {
+          setServerBotState((await res.json()) as ServerBotState);
+        }
+      } catch {
+        // Ignore transient network errors
+      }
+      return;
+    }
     setPositions((prev) =>
       prev.map((p) =>
         p.id === positionId ? {...p, stopLoss, takeProfit} : p,
@@ -2006,6 +2088,96 @@ export default function App() {
       `Net P&L: ${netPnl >= 0 ? '+' : ''}${formatCurrency(netPnl)} · Ending Equity: ${formatCurrency(
         newReport.endingEquity,
       )}`,
+      'SYSTEM',
+    );
+  };
+
+  const handleSyncBroker = async () => {
+    try {
+      const res = await fetch('/api/broker/sync', {method: 'POST'});
+      if (res.ok) {
+        setBrokerStatus((await res.json()) as BrokerStatus);
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  };
+
+  const handleToggleBrokerRouting = async (armed: boolean) => {
+    try {
+      const res = await fetch('/api/broker/mode', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({routingArmed: armed}),
+      });
+      if (res.ok) {
+        const nextStatus = (await res.json()) as BrokerStatus;
+        setBrokerStatus(nextStatus);
+        emitNotification(
+          armed ? `Broker Routing ARMED (${nextStatus.provider})` : 'Broker Routing DISARMED',
+          armed
+            ? `24/7 XAU Bot orders now route to ${nextStatus.accountLabel}.`
+            : 'Switched safely back to Paper Simulation ledger.',
+          'SYSTEM',
+        );
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  };
+
+  const handleResetCleanAccount = async (startingBalance = 10000) => {
+    const clean = createCleanAccountState(startingBalance);
+    setCashBalance(clean.cashBalance);
+    setDayStartEquity(clean.dayStartEquity);
+    setPositions([]);
+    setPendingOrders([]);
+    setExecutions([]);
+    setEodReports([]);
+    setXauBotTrades([]);
+    setXauBotLogs([]);
+    setXauBotAdaptations([]);
+    setNotifications([]);
+    setXauBotConfig((prev) => ({...prev, enabled: false}));
+    setServer247Enabled(false);
+
+    try {
+      const res = await fetch('/api/bot/reset', {method: 'POST'});
+      if (res.ok) {
+        const nextServer = (await res.json()) as ServerBotState;
+        setServerBotState(nextServer);
+        if (nextServer.brokerStatus) {
+          setBrokerStatus(nextServer.brokerStatus);
+        }
+      }
+    } catch {
+      // Ignore offline reset
+    }
+
+    await saveWorkspace({
+      cashBalance: clean.cashBalance,
+      dayStartEquity: clean.dayStartEquity,
+      positions: [],
+      pendingOrders: [],
+      executions: [],
+      priceAlerts,
+      notifications: [],
+      eodReports: [],
+      riskSettings,
+      securityState,
+      automationConfig,
+      xauBotConfig: {...xauBotConfig, enabled: false},
+      xauBotLogs: [],
+      xauBotTrades: [],
+      xauBotAdaptations: [],
+      drawings,
+      cachedInstruments: instruments,
+      lastSyncedAt: Date.now(),
+    });
+
+    emitNotification(
+      'Account Reset to Clean Baseline',
+      `Starting equity ${formatCurrency(clean.cashBalance)} with $0.00 historical P&L.`,
       'SYSTEM',
     );
   };
@@ -2176,7 +2348,7 @@ export default function App() {
                     candles={candles}
                     timeframe={timeframe}
                     onChangeTimeframe={setTimeframe}
-                    positions={positions}
+                    positions={allPositions}
                     alerts={priceAlerts}
                     orbAnalysis={activeOrbAnalysis}
                     drawings={drawings}
@@ -2417,6 +2589,8 @@ export default function App() {
                       }}
                       onClearLogs={() => setXauBotLogs([])}
                       onOpenStats={() => setActiveTab('bot')}
+                      brokerStatus={brokerStatus}
+                      onOpenBrokerSettings={() => setActiveTab('portfolio')}
                     />
                   ) : centerSubTab === 'CALENDAR' ? (
                     <EconomicCalendarPanel
@@ -2541,9 +2715,9 @@ export default function App() {
 
             {/* Full-Width Positions & Blotter */}
             <PositionsBlotter
-              positions={positions}
+              positions={allPositions}
               pendingOrders={pendingOrders}
-              executions={executions}
+              executions={allExecutions}
               instrumentsMap={instrumentsMap}
               isOnline={isOnline}
               onSelectSymbol={(sym) => {
@@ -2616,7 +2790,7 @@ export default function App() {
             freeMargin={freeMargin}
             marginLevelPct={marginLevelPct}
             unrealizedPnl={unrealizedPnl}
-            positions={positions}
+            positions={allPositions}
             instrumentsMap={instrumentsMap}
             riskSettings={riskSettings}
             onUpdateRiskSettings={setRiskSettings}
@@ -2626,6 +2800,10 @@ export default function App() {
               setSelectedSymbol(sym);
               setActiveTab('trade');
             }}
+            brokerStatus={brokerStatus}
+            onSyncBroker={handleSyncBroker}
+            onToggleBrokerRouting={handleToggleBrokerRouting}
+            onResetAccount={handleResetCleanAccount}
           />
         )}
 
@@ -2736,6 +2914,7 @@ export default function App() {
           <EODReportsView
             reports={eodReports}
             onGenerateTodayReport={handleGenerateTodayReport}
+            onResetAccount={handleResetCleanAccount}
           />
         )}
 
