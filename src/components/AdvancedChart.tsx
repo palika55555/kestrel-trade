@@ -763,11 +763,19 @@ export const AdvancedChart: React.FC<AdvancedChartProps> = ({
 
   const handlePointerUp = () => setIsDragging(false);
 
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? 8 : -8;
-    setVisibleCount((prev) => Math.max(24, Math.min(180, prev + delta)));
-  };
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? 8 : -8;
+      setVisibleCount((prev) => Math.max(24, Math.min(180, prev + delta)));
+    };
+    canvas.addEventListener('wheel', onWheel, {passive: false});
+    return () => {
+      canvas.removeEventListener('wheel', onWheel);
+    };
+  }, []);
 
   const activeCandle =
     hoverIdx !== null && candles[hoverIdx]
@@ -1023,7 +1031,6 @@ export const AdvancedChart: React.FC<AdvancedChartProps> = ({
             setHoverY(null);
             setIsDragging(false);
           }}
-          onWheel={handleWheel}
           className={activeTool === 'CURSOR' ? 'cursor-crosshair' : 'cursor-cell'}
         />
       </div>

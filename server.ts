@@ -875,7 +875,15 @@ class LiveMarketEngine {
       instruments: Array.from(this.instruments.values()),
     });
     for (const res of this.subscribers) {
-      res.write(`data: ${payload}\n\n`);
+      if (res.writableEnded || res.destroyed) {
+        this.subscribers.delete(res);
+        continue;
+      }
+      try {
+        res.write(`data: ${payload}\n\n`);
+      } catch {
+        this.subscribers.delete(res);
+      }
     }
   }
 
@@ -1823,6 +1831,7 @@ class LiveMarketEngine {
       ...this.serverBot,
       netPnl: roundToDecimals(realizedNet + unrealNet, 2),
       brokerStatus: this.getBrokerStatus(),
+      machineId: process.env.FLY_MACHINE_ID || process.env.HOSTNAME || 'local',
     };
   }
 
@@ -2372,9 +2381,14 @@ async function startServer() {
   });
 
   app.get('/api/stream', (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('X-Accel-Buffering', 'no');
+    req.setTimeout(0);
+    res.setTimeout(0);
+    req.socket?.setTimeout(0);
+    req.socket?.setNoDelay?.(true);
     res.flushHeaders?.();
 
     const initial = JSON.stringify({
@@ -2382,10 +2396,25 @@ async function startServer() {
       timestamp: Date.now(),
       instruments: engine.getMarkets(),
     });
-    res.write(`data: ${initial}\n\n`);
+    res.write(`retry: 3000\ndata: ${initial}\n\n`);
 
     engine.addSubscriber(res);
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded || res.destroyed) {
+        clearInterval(heartbeat);
+        engine.removeSubscriber(res);
+        return;
+      }
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        clearInterval(heartbeat);
+        engine.removeSubscriber(res);
+      }
+    }, 15_000);
+
     req.on('close', () => {
+      clearInterval(heartbeat);
       engine.removeSubscriber(res);
     });
   });
@@ -2425,6 +2454,9 @@ async function startServer() {
       `Kestrel Trade server (${useViteDev ? 'dev' : 'production'}) listening on http://0.0.0.0:${PORT}`,
     );
   });
+  httpServer.requestTimeout = 0;
+  httpServer.keepAliveTimeout = 65_000;
+  httpServer.headersTimeout = 66_000;
   httpServer.on('error', (err) => {
     console.error('[boot] HTTP server listen error:', err);
     process.exit(1);

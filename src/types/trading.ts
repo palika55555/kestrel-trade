@@ -509,6 +509,7 @@ export interface ServerBotState {
   lastEvaluatedAt: number;
   brokerRoutingArmed?: boolean;
   brokerStatus?: BrokerStatus;
+  machineId?: string;
 }
 
 export type ActiveTab = 'trade' | 'bot' | 'portfolio' | 'alerts' | 'reports' | 'security';

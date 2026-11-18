@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  AlertTriangle,
   BarChart2,
   Bot,
   Brain,
@@ -48,6 +49,7 @@ interface XauAutoBotPanelProps {
   onOpenStats?: () => void;
   brokerStatus?: BrokerStatus | null;
   onOpenBrokerSettings?: () => void;
+  multiMachineDetected?: boolean;
 }
 
 export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
@@ -71,6 +73,7 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
   onOpenStats,
   brokerStatus,
   onOpenBrokerSettings,
+  multiMachineDetected,
 }) => {
   const closedBotExecs = botExecutions.filter((e) => e.action !== 'OPEN');
   const realizedPnl = closedBotExecs.reduce((a, e) => a + e.realizedPnl - e.fee, 0);
@@ -229,7 +232,7 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
               {server247Enabled
                 ? '24/7 Server: ON'
                 : wakeLockActive
-                ? 'Browser (Wake Lock)'
+                ? '24/7 Server: OFF (Browser)'
                 : '24/7 Server: OFF'}
             </span>
           </button>
@@ -257,6 +260,24 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
           )}
         </div>
       </div>
+
+      {multiMachineDetected && (
+        <div className="flex items-start gap-2.5 px-3 py-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-300 text-xs">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-500" />
+          <div className="space-y-0.5">
+            <div className="font-semibold">
+              Detegované 2 aktívne serverové inštancie (Fly.io Split-Brain)
+            </div>
+            <div className="text-[11px] opacity-90">
+              Váš backend beží na 2 oddelených strojoch, preto sa stav bota (PAUSED/RUNNING) a obchody môžu striedať každých pár sekúnd. Ponechajte iba 1 stroj príkazom{' '}
+              <code className="px-1 py-0.5 rounded bg-amber-500/15 font-mono">
+                fly scale count 1 -a kestrel-trade
+              </code>{' '}
+              alebo vymažte druhý stroj vo Fly Dashboarde (Machines).
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Bot Performance KPIs */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">

@@ -154,6 +154,7 @@ export default function App() {
   const [calendarSnapshot, setCalendarSnapshot] = useState<EconomicCalendarSnapshot | null>(null);
   const [server247Enabled, setServer247Enabled] = useState<boolean>(false);
   const [serverBotState, setServerBotState] = useState<ServerBotState | null>(null);
+  const [multiMachineDetected, setMultiMachineDetected] = useState<boolean>(false);
   const [brokerStatus, setBrokerStatus] = useState<BrokerStatus | null>(null);
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
   const [candlesBySymbol, setCandlesBySymbol] = useState<Record<string, Candle[]>>({});
@@ -340,6 +341,9 @@ export default function App() {
   calendarSnapshotRef.current = calendarSnapshot;
   const server247EnabledRef = useRef(server247Enabled);
   server247EnabledRef.current = server247Enabled;
+  const seenMachineIdsRef = useRef<Set<string>>(new Set());
+  const botMutationStampRef = useRef<number>(0);
+  const userChoseBrowserModeRef = useRef<boolean>(false);
   const xauBotLastTradeRef = useRef<number>(0);
   const xauBotLastHoldLogRef = useRef<number>(0);
   const signalCooldownRef = useRef<Record<string, number>>({});
@@ -1569,11 +1573,21 @@ export default function App() {
         if (!res.ok) return;
         const data = (await res.json()) as ServerBotState;
         if (cancelled) return;
+        if (data.machineId) {
+          seenMachineIdsRef.current.add(data.machineId);
+          if (seenMachineIdsRef.current.size > 1) {
+            setMultiMachineDetected(true);
+          }
+        }
+        // Avoid overwriting UI with stale poll response right after user toggled bot/mode
+        if (Date.now() - botMutationStampRef.current < 1500) {
+          return;
+        }
         setServerBotState(data);
         if (data.brokerStatus) {
           setBrokerStatus(data.brokerStatus);
         }
-        if (data.enabled) {
+        if (data.enabled && !userChoseBrowserModeRef.current) {
           setServer247Enabled(true);
         }
       } catch {
@@ -1630,8 +1644,11 @@ export default function App() {
 
   const syncConfigToBot = useCallback(
     async (next: XauBotConfig) => {
-      setXauBotConfig(next);
-      if (server247EnabledRef.current && isOnline) {
+      if (server247EnabledRef.current) {
+        // Keep browser loop disabled while 24/7 server worker owns execution
+        setXauBotConfig({...next, enabled: false});
+        if (!isOnline) return;
+        botMutationStampRef.current = Date.now();
         try {
           const res = await fetch('/api/bot/config', {
             method: 'POST',
@@ -1639,18 +1656,24 @@ export default function App() {
             body: JSON.stringify(next),
           });
           if (res.ok) {
-            setServerBotState((await res.json()) as ServerBotState);
+            const data = (await res.json()) as ServerBotState;
+            botMutationStampRef.current = Date.now();
+            setServerBotState(data);
           }
         } catch {
           // Ignore transient error
         }
+        return;
       }
+      setXauBotConfig(next);
     },
     [isOnline],
   );
 
   const handleToggleServer247 = useCallback(async () => {
     const nextMode = !server247EnabledRef.current;
+    botMutationStampRef.current = Date.now();
+    userChoseBrowserModeRef.current = !nextMode;
     setServer247Enabled(nextMode);
     if (nextMode) {
       // Hand off to 24/7 backend worker and pause local browser loop
@@ -1663,7 +1686,9 @@ export default function App() {
           body: JSON.stringify(payload),
         });
         if (res.ok) {
-          setServerBotState((await res.json()) as ServerBotState);
+          const data = (await res.json()) as ServerBotState;
+          botMutationStampRef.current = Date.now();
+          setServerBotState(data);
         }
       } catch {
         // Ignore
@@ -1673,6 +1698,7 @@ export default function App() {
         'Switched to 24/7 Server Worker mode (runs in Node.js backend even if browser closes).',
       );
     } else {
+      setXauBotConfig((prev) => ({...prev, enabled: false}));
       try {
         const res = await fetch('/api/bot/config', {
           method: 'POST',
@@ -1680,7 +1706,9 @@ export default function App() {
           body: JSON.stringify({enabled: false}),
         });
         if (res.ok) {
-          setServerBotState((await res.json()) as ServerBotState);
+          const data = (await res.json()) as ServerBotState;
+          botMutationStampRef.current = Date.now();
+          setServerBotState(data);
         }
       } catch {
         // Ignore
@@ -2433,6 +2461,7 @@ export default function App() {
                       isOnline={isOnline}
                       server247Enabled={server247Enabled}
                       wakeLockActive={wakeLockActive}
+                      multiMachineDetected={multiMachineDetected}
                       onToggleServer247={handleToggleServer247}
                       onOpenCalendar={() => setCenterSubTab('CALENDAR')}
                       onUpdateConfig={syncConfigToBot}
