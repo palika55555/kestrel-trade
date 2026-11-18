@@ -1674,12 +1674,20 @@ async function startServer() {
   });
 
   if (useViteDev) {
-    const {createServer: createViteServer} = await import('vite');
-    const vite = await createViteServer({
-      server: {middlewareMode: true},
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+    try {
+      const {createServer: createViteServer} = await import('vite');
+      const vite = await createViteServer({
+        server: {middlewareMode: true},
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } catch (err) {
+      console.warn('[boot] Vite dev middleware unavailable, serving static dist:', err);
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
   } else {
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
@@ -1687,11 +1695,30 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  console.log('[boot] binding HTTP server...', {
+    port: PORT,
+    useViteDev,
+    hasBuiltDist,
+    flyApp: process.env.FLY_APP_NAME || null,
+    nodeEnv: process.env.NODE_ENV || null,
+  });
+
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `Kestrel Trade server (${useViteDev ? 'dev' : 'production'}) listening on http://0.0.0.0:${PORT}`,
     );
   });
+  httpServer.on('error', (err) => {
+    console.error('[boot] HTTP server listen error:', err);
+    process.exit(1);
+  });
 }
 
-startServer();
+process.on('unhandledRejection', (reason) => {
+  console.error('[runtime] Unhandled promise rejection:', reason);
+});
+
+startServer().catch((err) => {
+  console.error('[boot] Fatal startup error:', err);
+  process.exit(1);
+});

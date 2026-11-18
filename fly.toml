@@ -1,6 +1,5 @@
 # Fly.io configuration for 24/7 always-on execution on 0.0.0.0:8080
-# Run: fly launch --no-deploy (or fly deploy --ha=false)
-
+app = 'kestrel-trade'
 primary_region = 'ams'
 
 [build]
@@ -19,6 +18,6 @@ primary_region = 'ams'
   processes = ['app']
 
 [[vm]]
-  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
+  memory = '1gb'
