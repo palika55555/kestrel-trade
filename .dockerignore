@@ -1,0 +1,10 @@
+node_modules
+dist
+dev-dist
+.git
+.gitignore
+.kestrel-server-bot.json
+.env
+.env.local
+.env.*.local
+*.log
