@@ -207,6 +207,15 @@ export class BrokerBridge {
       accountLabel = 'Custom Broker Webhook Bridge';
     }
     const selectionError = env.provider === 'SIMULATION' ? env.selectionError : null;
+    let liveLimits: BrokerStatus['liveLimits'];
+    let liveLimitsError: string | null = null;
+    if (env.configured) {
+      try {
+        liveLimits = readLiveRiskLimits();
+      } catch (err) {
+        liveLimitsError = err instanceof Error ? err.message : 'Invalid live risk limits';
+      }
+    }
     return {
       provider: env.provider,
       configured: env.configured,
@@ -222,7 +231,8 @@ export class BrokerBridge {
       openPositionsCount: this.brokerCache.openPositionsCount,
       lastSyncedAt: this.brokerCache.lastSyncedAt,
       lastOrderSummary: this.brokerCache.lastOrderSummary,
-      lastError: this.brokerCache.lastError ?? selectionError,
+      lastError: this.brokerCache.lastError ?? selectionError ?? liveLimitsError,
+      ...(liveLimits ? {liveLimits} : {}),
     };
   }
 

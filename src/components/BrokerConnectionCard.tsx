@@ -178,6 +178,33 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
         </div>
       </div>
 
+      {configured &&
+        brokerStatus?.liveLimits &&
+        Object.values(brokerStatus.liveLimits).some((v) => v !== null) && (
+          <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] px-3 py-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[11px] font-mono tabular-nums">
+            <span className="text-slate-500 dark:text-slate-400 font-sans font-semibold">
+              Server .env Live Risk Caps:
+            </span>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-700 dark:text-slate-300">
+              {brokerStatus.liveLimits.maxLot !== null && (
+                <span>Max Lot: {brokerStatus.liveLimits.maxLot.toFixed(2)}</span>
+              )}
+              {brokerStatus.liveLimits.maxRiskPerTrade !== null && (
+                <span>Max Risk/Trade: ${brokerStatus.liveLimits.maxRiskPerTrade}</span>
+              )}
+              {brokerStatus.liveLimits.dailyLossLimit !== null && (
+                <span>Daily Loss Cap: ${brokerStatus.liveLimits.dailyLossLimit}</span>
+              )}
+              {brokerStatus.liveLimits.minEquity !== null && (
+                <span>Min Equity: ${brokerStatus.liveLimits.minEquity}</span>
+              )}
+              {brokerStatus.liveLimits.maxPositions !== null && (
+                <span>Max Pos: {brokerStatus.liveLimits.maxPositions}</span>
+              )}
+            </div>
+          </div>
+        )}
+
       {brokerStatus?.lastError && (
         <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
           <AlertTriangle className="w-4 h-4 shrink-0" />

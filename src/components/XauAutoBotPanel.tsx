@@ -90,6 +90,28 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
       .reduce((a, e) => a + e.realizedPnl - e.fee, 0) + unrealizedPnl;
   const circuitBreakerHit = dailyPnl <= -Math.abs(config.maxDailyLossDollars);
 
+  const liveLimits = brokerStatus?.liveLimits;
+  const effSlForCap = evaluation?.effectiveSlDollars ?? config.stopLossDollars;
+  const maxByLot = liveLimits?.maxLot ?? Number.POSITIVE_INFINITY;
+  const maxByRisk =
+    liveLimits?.maxRiskPerTrade != null && effSlForCap > 0
+      ? Math.floor(liveLimits.maxRiskPerTrade / (effSlForCap * 100) / 0.01 + 1e-9) * 0.01
+      : Number.POSITIVE_INFINITY;
+  const rawLiveCap = Math.min(maxByLot, maxByRisk);
+  const liveCapLot = Number.isFinite(rawLiveCap)
+    ? Math.max(0.01, Math.round(rawLiveCap * 100) / 100)
+    : null;
+  const requestedLot = evaluation?.effectiveLotSize ?? config.lotSize;
+  const isLiveLotCapped = Boolean(
+    brokerStatus?.routingArmed && liveCapLot !== null && requestedLot > liveCapLot,
+  );
+  const capReason =
+    maxByRisk <= maxByLot && liveLimits?.maxRiskPerTrade != null
+      ? `LIVE_MAX_RISK_PER_TRADE $${liveLimits.maxRiskPerTrade} / SL $${effSlForCap.toFixed(1)}`
+      : liveLimits?.maxLot != null
+      ? `LIVE_MAX_LOT ${liveLimits.maxLot}`
+      : '.env risk guard';
+
   return (
     <div className="bg-white dark:bg-[#121721] border border-slate-200 dark:border-[#1E2636] rounded-xl p-4 space-y-4">
       {/* Header & Primary Controls */}
@@ -628,9 +650,15 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
                   </>
                 )}
                 <span>Regime: {evaluation.regime}</span>
-                <span>
+                <span className="tabular-nums">
                   Eff SL ${evaluation.effectiveSlDollars.toFixed(1)} · Lot{' '}
-                  {evaluation.effectiveLotSize.toFixed(2)}
+                  {isLiveLotCapped && liveCapLot !== null ? (
+                    <span className="text-amber-600 dark:text-amber-400 font-semibold">
+                      {liveCapLot.toFixed(2)} (capped from {evaluation.effectiveLotSize.toFixed(2)})
+                    </span>
+                  ) : (
+                    evaluation.effectiveLotSize.toFixed(2)
+                  )}
                 </span>
                 {evaluation.antiTilt.trailingLosses >= 2 && (
                   <span className="text-amber-500 font-semibold">
@@ -705,6 +733,14 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
             }
             className="w-full rounded-lg border border-slate-200 dark:border-[#242E42] bg-slate-50 dark:bg-[#0D1119] px-2.5 py-1.5 font-mono text-slate-900 dark:text-slate-100"
           />
+          {isLiveLotCapped && liveCapLot !== null && (
+            <div
+              title={capReason}
+              className="mt-1 text-[10px] font-mono tabular-nums text-amber-600 dark:text-amber-400 leading-tight"
+            >
+              Live cap: {liveCapLot.toFixed(2)} lot ({capReason})
+            </div>
+          )}
         </div>
 
         <div>

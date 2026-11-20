@@ -656,6 +656,14 @@ export interface EconomicCalendarSnapshot {
 
 export type BrokerProvider = 'SIMULATION' | 'OANDA' | 'METAAPI' | 'CTRADER' | 'MT5' | 'WEBHOOK';
 
+export interface BrokerLiveLimits {
+  maxLot: number | null;
+  maxRiskPerTrade: number | null;
+  dailyLossLimit: number | null;
+  minEquity: number | null;
+  maxPositions: number | null;
+}
+
 export interface BrokerStatus {
   provider: BrokerProvider;
   configured: boolean;
@@ -673,6 +681,8 @@ export interface BrokerStatus {
   lastSyncedAt: number | null;
   lastOrderSummary: string | null;
   lastError: string | null;
+  /** Active server-side .env LIVE_* hard risk caps applied to live broker orders. */
+  liveLimits?: BrokerLiveLimits;
 }
 
 export interface ServerBotState {

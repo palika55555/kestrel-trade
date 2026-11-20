@@ -17,6 +17,11 @@ const BROKER_ENV_KEYS = [
   'MT5_BRIDGE_SECRET',
   'MT5_SYMBOL_XAU',
   'BROKER_WEBHOOK_URL',
+  'LIVE_MAX_LOT',
+  'LIVE_MAX_RISK_PER_TRADE',
+  'LIVE_DAILY_LOSS_LIMIT',
+  'LIVE_MIN_EQUITY',
+  'LIVE_MAX_POSITIONS',
 ];
 
 const ACCOUNT = {
@@ -273,5 +278,29 @@ describe('BrokerBridge MT5 routing', () => {
     const c = await bridge.fetchMt5Candles('5m', 200);
     expect(q?.bid).toBe(3510.2);
     expect(c?.[0].close).toBe(3510.3);
+  });
+
+  it('exposes configured LIVE_* risk limits in getBrokerStatus and surfaces invalid values', () => {
+    setEnv({
+      BROKER_PROVIDER: 'MT5',
+      MT5_BRIDGE_SECRET: 'x',
+      LIVE_MAX_LOT: '0.05',
+      LIVE_MAX_RISK_PER_TRADE: '25',
+      LIVE_MAX_POSITIONS: '2',
+    });
+    const status = new BrokerBridge(makeHost()).getBrokerStatus();
+    expect(status.liveLimits).toEqual({
+      maxLot: 0.05,
+      maxRiskPerTrade: 25,
+      dailyLossLimit: null,
+      minEquity: null,
+      maxPositions: 2,
+    });
+    expect(status.lastError).toBeNull();
+
+    setEnv({BROKER_PROVIDER: 'MT5', MT5_BRIDGE_SECRET: 'x', LIVE_MAX_LOT: '-1'});
+    const badStatus = new BrokerBridge(makeHost()).getBrokerStatus();
+    expect(badStatus.liveLimits).toBeUndefined();
+    expect(badStatus.lastError).toMatch(/LIVE_MAX_LOT/);
   });
 });
