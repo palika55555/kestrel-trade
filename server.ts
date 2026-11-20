@@ -9,6 +9,7 @@ import type {
   CotPositioning,
   EconomicCalendarSnapshot,
   EconomicEvent,
+  GoldMarketRegime,
   InstitutionalGoldContext,
   Instrument,
   MarketPrint,
@@ -20,6 +21,7 @@ import type {
   TradeExecution,
   XauBotConfig,
   XauBotLogEntry,
+  XauBotStrategy,
   XauBotTradeRecord,
 } from './src/types/trading.js';
 
@@ -499,12 +501,17 @@ function createServerBotDefaultConfig(): XauBotConfig {
     useMacroConfluence: true,
     useSessionSpreadGuard: true,
     useNewsGuard: true,
+    useKillzonesOnly: false,
+    useAtrRiskScaling: true,
+    riskPerTradePct: 0,
+    antiTiltCooldownMinutes: 15,
+    staleTradeMinutes: 45,
     newsPauseMinutesBefore: 15,
     newsPauseMinutesAfter: 15,
     maxSpreadDollars: 1.2,
     autoBreakEvenEnabled: true,
     partialTpEnabled: true,
-    strategy: 'ORB_VWAP',
+    strategy: 'SMART_ENSEMBLE',
     lotSize: 0.1,
     leverage: 15,
     stopLossDollars: 8.0,
@@ -527,6 +534,11 @@ function serverEmaLast(candles: Candle[], period: number): number {
   return ema;
 }
 
+function serverEmaPrev(candles: Candle[], period: number): number {
+  if (candles.length < 2) return serverEmaLast(candles, period);
+  return serverEmaLast(candles.slice(0, -1), period);
+}
+
 function serverRsiLast(candles: Candle[], period = 14): number {
   if (candles.length <= period) return 50;
   let gains = 0;
@@ -539,6 +551,195 @@ function serverRsiLast(candles: Candle[], period = 14): number {
   if (losses === 0) return 75;
   const rs = gains / period / (losses / period);
   return 100 - 100 / (1 + rs);
+}
+
+function serverVwapLast(candles: Candle[]): number {
+  if (candles.length === 0) return 0;
+  const recent = candles.slice(-40);
+  let cumPV = 0;
+  let cumV = 0;
+  for (const c of recent) {
+    const tp = (c.high + c.low + c.close) / 3;
+    const vol = Math.max(1, c.volume);
+    cumPV += tp * vol;
+    cumV += vol;
+  }
+  return cumV > 0 ? cumPV / cumV : recent[recent.length - 1].close;
+}
+
+function serverAtr14(candles: Candle[]): number {
+  if (candles.length < 15) return 2.2;
+  let sum = 0;
+  const start = candles.length - 14;
+  for (let i = start; i < candles.length; i++) {
+    const cur = candles[i];
+    const prev = candles[i - 1];
+    const tr = Math.max(
+      cur.high - cur.low,
+      Math.abs(cur.high - prev.close),
+      Math.abs(cur.low - prev.close),
+    );
+    sum += tr;
+  }
+  return roundToDecimals(sum / 14, 2);
+}
+
+function serverBollingerLast(candles: Candle[], period = 20): {upper: number; lower: number; mid: number} {
+  const slice = candles.slice(-period);
+  if (slice.length === 0) return {upper: 0, lower: 0, mid: 0};
+  const mean = slice.reduce((a, c) => a + c.close, 0) / slice.length;
+  const variance = slice.reduce((a, c) => a + (c.close - mean) ** 2, 0) / slice.length;
+  const std = Math.sqrt(variance);
+  return {upper: mean + 2 * std, lower: mean - 2 * std, mid: mean};
+}
+
+function serverDetectRegime(
+  candles: Candle[],
+  ema9: number,
+  ema21: number,
+  bbUpper: number,
+  bbLower: number,
+  rsi14: number,
+  atr14: number,
+): GoldMarketRegime {
+  if (candles.length < 18) return 'RANGING';
+  const slice = candles.slice(-15);
+  const netMove = Math.abs(slice[slice.length - 1].close - slice[0].close);
+  let pathSum = 0;
+  for (let i = 1; i < slice.length; i++) {
+    pathSum += Math.abs(slice[i].close - slice[i - 1].close);
+  }
+  const eff = pathSum > 0 ? netMove / pathSum : 0;
+  const price = slice[slice.length - 1].close || 1;
+  const bbWidthPct = ((bbUpper - bbLower) / price) * 100;
+  const emaGap = Math.abs(ema9 - ema21);
+  if ((rsi14 >= 70 || rsi14 <= 30) && bbWidthPct >= 0.45) return 'VOLATILE_REVERSAL';
+  if (eff >= 0.42 && emaGap >= Math.max(0.4, atr14 * 0.28)) return 'TRENDING';
+  if (bbWidthPct <= 0.32 || (eff >= 0.34 && netMove >= atr14 * 1.4)) return 'BREAKOUT';
+  return 'RANGING';
+}
+
+function serverAtasBarSignals(candles: Candle[]): {
+  absorption: 'BULLISH_ABSORPTION' | 'BEARISH_ABSORPTION' | 'NONE';
+  cvdDivergence: 'BULLISH' | 'BEARISH' | 'NONE';
+} {
+  if (candles.length < 8) return {absorption: 'NONE', cvdDivergence: 'NONE'};
+  const recent = candles.slice(-8);
+  const avgVol = recent.reduce((a, b) => a + Math.max(1, b.volume), 0) / recent.length;
+  const last = recent[recent.length - 1];
+  const prev = recent[recent.length - 2];
+  const barRange = Math.max(0.05, last.high - last.low);
+  const closePos = (last.close - last.low) / barRange;
+
+  let absorption: 'BULLISH_ABSORPTION' | 'BEARISH_ABSORPTION' | 'NONE' = 'NONE';
+  if (last.volume >= avgVol * 1.35) {
+    if (closePos >= 0.65 && last.close <= prev.close) absorption = 'BULLISH_ABSORPTION';
+    else if (closePos <= 0.35 && last.close >= prev.close) absorption = 'BEARISH_ABSORPTION';
+  }
+
+  let cvdFirst = 0;
+  let cvdSecond = 0;
+  recent.forEach((b, idx) => {
+    const r = Math.max(0.05, b.high - b.low);
+    const d = ((b.close - b.open) / r) * Math.max(1, b.volume);
+    if (idx < 4) cvdFirst += d;
+    else cvdSecond += d;
+  });
+  let cvdDivergence: 'BULLISH' | 'BEARISH' | 'NONE' = 'NONE';
+  if (last.close < recent[0].close && cvdSecond > cvdFirst + avgVol * 0.4) cvdDivergence = 'BULLISH';
+  else if (last.close > recent[0].close && cvdSecond < cvdFirst - avgVol * 0.4) cvdDivergence = 'BEARISH';
+
+  return {absorption, cvdDivergence};
+}
+
+function serverInKillzone(nowMs: number): boolean {
+  const d = new Date(nowMs);
+  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return (mins >= 420 && mins <= 660) || (mins >= 750 && mins <= 1050);
+}
+
+function serverAdaptConfig(
+  current: XauBotConfig,
+  closedTrades: XauBotTradeRecord[],
+): {nextConfig: XauBotConfig; summary: string | null} {
+  if (closedTrades.length < 2) return {nextConfig: current, summary: null};
+  const chronological = [...closedTrades].sort((a, b) => a.closedAt - b.closedAt);
+  const recent = chronological.slice(-5);
+  const recentWins = recent.filter((t) => t.netPnl > 0).length;
+  const recentWr = (recentWins / recent.length) * 100;
+
+  let trailingLosses = 0;
+  let trailingWins = 0;
+  for (let i = chronological.length - 1; i >= 0; i--) {
+    if (chronological[i].netPnl < 0 && trailingWins === 0) trailingLosses += 1;
+    else if (chronological[i].netPnl > 0 && trailingLosses === 0) trailingWins += 1;
+    else break;
+  }
+
+  const next: XauBotConfig = {...current};
+  const changes: string[] = [];
+
+  const strats: XauBotStrategy[] = [
+    'SMART_ENSEMBLE',
+    'ORB_VWAP',
+    'LIQUIDITY_SWEEP_SMC',
+    'ORDERFLOW_LIQUIDITY',
+    'EMA_MOMENTUM',
+    'BOLLINGER_REVERSION',
+  ];
+  const byStrat = strats.map((s) => {
+    const rows = chronological.filter((t) => t.strategy === s);
+    const net = rows.reduce((a, r) => a + r.netPnl, 0);
+    return {strategy: s, count: rows.length, net, avg: rows.length > 0 ? net / rows.length : 0};
+  });
+  const curStat = byStrat.find((x) => x.strategy === current.strategy);
+  if (curStat && curStat.count >= 2 && (curStat.net < 0 || trailingLosses >= 2)) {
+    const better = byStrat
+      .filter((x) => x.strategy !== current.strategy && x.count >= 2 && x.avg > curStat.avg)
+      .sort((a, b) => b.avg - a.avg)[0];
+    const fallback = current.strategy !== 'SMART_ENSEMBLE' ? byStrat.find((x) => x.strategy === 'SMART_ENSEMBLE') : undefined;
+    const candidate = better || fallback;
+    if (candidate) {
+      next.strategy = candidate.strategy;
+      changes.push(`Strategy ${current.strategy}->${candidate.strategy}`);
+    }
+  }
+
+  if ((recent.length >= 3 && recentWr < 45) || trailingLosses >= 2) {
+    const raised = Math.min(85, current.minConfidence + 5);
+    if (raised !== current.minConfidence) {
+      next.minConfidence = raised;
+      changes.push(`MinConf ${current.minConfidence}%->${raised}%`);
+    }
+  } else if (recent.length >= 4 && recentWr >= 70 && current.minConfidence > 50) {
+    const eased = Math.max(50, current.minConfidence - 5);
+    if (eased !== current.minConfidence) {
+      next.minConfidence = eased;
+      changes.push(`MinConf ${current.minConfidence}%->${eased}%`);
+    }
+  }
+
+  const slHits = recent.filter((t) => t.exitAction === 'STOP_LOSS').length;
+  const tpHits = recent.filter((t) => t.exitAction === 'TAKE_PROFIT').length;
+  if (slHits >= 2 && slHits > tpHits) {
+    const widerSl = Math.min(18, roundToDecimals(current.stopLossDollars + 1.5, 2));
+    if (widerSl !== current.stopLossDollars) {
+      next.stopLossDollars = widerSl;
+      next.takeProfitDollars = Math.min(36, Math.max(current.takeProfitDollars, roundToDecimals(widerSl * 1.8, 2)));
+      changes.push(`SL $${current.stopLossDollars}->$${widerSl}`);
+    }
+  } else if (tpHits >= 2 && recentWr >= 60) {
+    const extTp = Math.min(32, roundToDecimals(current.takeProfitDollars + 2, 2));
+    if (extTp !== current.takeProfitDollars) {
+      next.takeProfitDollars = extTp;
+      changes.push(`TP $${current.takeProfitDollars}->$${extTp}`);
+    }
+  }
+
+  return {
+    nextConfig: changes.length > 0 ? next : current,
+    summary: changes.length > 0 ? changes.join(' · ') : null,
+  };
 }
 
 class LiveMarketEngine {
@@ -1252,22 +1453,52 @@ class LiveMarketEngine {
     const remaining: Position[] = [];
     let stateDirty = false;
 
-    // 1. Manage open 24/7 Server Bot positions (Trailing Stop, Auto BE, Partial TP, SL/TP)
+    const tfMap = this.candleCache.get('XAU/USD');
+    const c15 = tfMap?.get('15m') || [];
+    const c1h = tfMap?.get('1H') || [];
+    const c5 = tfMap?.get('5m') || [];
+    const bars = c5.length >= 22 ? c5 : c15;
+    const macro = this.getGoldMacro();
+    const prints = this.recentPrints.get('XAU/USD') || [];
+    const buyPrints = prints.filter((p) => p.side === 'BUY').length;
+    const buyPct = prints.length > 0 ? Math.round((buyPrints / prints.length) * 100) : 50;
+    const mtfBull =
+      c15.length >= 22 && c1h.length >= 22
+        ? serverEmaLast(c15, 9) > serverEmaLast(c15, 21) &&
+          serverEmaLast(c1h, 9) > serverEmaLast(c1h, 21)
+        : null;
+    const mtfBear =
+      c15.length >= 22 && c1h.length >= 22
+        ? serverEmaLast(c15, 9) < serverEmaLast(c15, 21) &&
+          serverEmaLast(c1h, 9) < serverEmaLast(c1h, 21)
+        : null;
+
+    let anyClosedThisTick = false;
+
+    // 1. Manage open 24/7 Server Bot positions (Trailing Stop, Auto BE, Partial TP, Early Exit, SL/TP)
     for (const pos of this.serverBot.positions) {
       const exitMark = pos.side === 'BUY' ? xau.bid : xau.ask;
       let cur = {...pos};
 
       if (cur.trailingStopDistance && cur.trailingStopDistance > 0) {
         if (cur.side === 'BUY' && exitMark > cur.peakFavorablePrice) {
+          const prevSl = cur.stopLoss ?? 0;
           const sl = roundToDecimals(exitMark - cur.trailingStopDistance, 2);
           cur.peakFavorablePrice = exitMark;
           cur.stopLoss = cur.stopLoss ? Math.max(cur.stopLoss, sl) : sl;
           stateDirty = true;
+          if (Math.abs(cur.stopLoss - prevSl) >= 0.25) {
+            void this.routeBrokerModifyRisk(cur, cur.stopLoss, cur.takeProfit);
+          }
         } else if (cur.side === 'SELL' && exitMark < cur.peakFavorablePrice) {
+          const prevSl = cur.stopLoss ?? 999_999;
           const sl = roundToDecimals(exitMark + cur.trailingStopDistance, 2);
           cur.peakFavorablePrice = exitMark;
           cur.stopLoss = cur.stopLoss ? Math.min(cur.stopLoss, sl) : sl;
           stateDirty = true;
+          if (Math.abs(cur.stopLoss - prevSl) >= 0.25) {
+            void this.routeBrokerModifyRisk(cur, cur.stopLoss, cur.takeProfit);
+          }
         }
       }
 
@@ -1321,6 +1552,7 @@ class LiveMarketEngine {
             cur.partialTpTaken = true;
             cur.breakEvenMoved = true;
             stateDirty = true;
+            anyClosedThisTick = true;
             void this.routeBrokerCloseOrder(pos, 0.5);
             this.appendServerBotLog('EXECUTION', `Partial TP 50% (${closeQty} lots) -> +$${net.toFixed(2)}`);
           }
@@ -1336,6 +1568,19 @@ class LiveMarketEngine {
       if (!hitAction && cur.takeProfit !== null) {
         if ((cur.side === 'BUY' && exitMark >= cur.takeProfit) || (cur.side === 'SELL' && exitMark <= cur.takeProfit)) {
           hitAction = 'TAKE_PROFIT';
+        }
+      }
+
+      // Time-Stop / Early Exit if trade stagnates in loss and MTF + Order Flow both flipped against it
+      const staleMin = cfg.staleTradeMinutes ?? 45;
+      if (!hitAction && staleMin > 0 && now - cur.openedAt >= staleMin * 60_000) {
+        const unrealDiff = cur.side === 'BUY' ? exitMark - cur.entryPrice : cur.entryPrice - exitMark;
+        if (unrealDiff < 0) {
+          const flippedBear = cur.side === 'BUY' && mtfBear === true && buyPct <= 42;
+          const flippedBull = cur.side === 'SELL' && mtfBull === true && buyPct >= 58;
+          if (flippedBear || flippedBull) {
+            hitAction = 'EARLY_EXIT';
+          }
         }
       }
 
@@ -1384,12 +1629,22 @@ class LiveMarketEngine {
           ...this.serverBot.executions,
         ].slice(0, 200);
         this.appendServerBotLog(net >= 0 ? 'EXECUTION' : 'RISK', `Closed ${cur.side} ${cur.quantity} (${hitAction}) -> ${net >= 0 ? '+' : ''}$${net.toFixed(2)}`);
+        anyClosedThisTick = true;
         stateDirty = true;
       } else {
         remaining.push(cur);
       }
     }
     this.serverBot.positions = remaining;
+
+    if (anyClosedThisTick && (cfg.autoLearnEnabled ?? true)) {
+      const adapted = serverAdaptConfig(this.serverBot.config, this.serverBot.closedTrades);
+      if (adapted.summary) {
+        this.serverBot.config = adapted.nextConfig;
+        this.appendServerBotLog('LEARN', `Auto-Learn tuned: ${adapted.summary}`);
+        stateDirty = true;
+      }
+    }
 
     // 2. Check Drawdown Circuit Breaker
     const pnl = this.computeServerBotPnl(xau);
@@ -1405,193 +1660,259 @@ class LiveMarketEngine {
       return;
     }
 
-    // 3. Evaluate Entry Signals (News Guard + Spread Guard + MTF + Macro + Order Flow)
-    const maxTrades = Math.max(1, Math.min(10, Math.round(cfg.maxConcurrentPositions || 3)));
-    const cooldownMs = Math.max(5, cfg.cooldownSeconds || 25) * 1000;
+    // 3. Evaluate Entry Signals (Multi-Strategy + Regime + ATAS + MTF + Macro + Institutional + Guards)
+    const activeCfg = this.serverBot.config;
+    const maxTrades = Math.max(1, Math.min(10, Math.round(activeCfg.maxConcurrentPositions || 3)));
+    const cooldownMs = Math.max(5, activeCfg.cooldownSeconds || 25) * 1000;
     if (
       this.serverBot.positions.length < maxTrades &&
-      now - this.serverBotLastTradeAt >= cooldownMs
+      now - this.serverBotLastTradeAt >= cooldownMs &&
+      bars.length >= 22
     ) {
-      const tfMap = this.candleCache.get('XAU/USD');
-      const c15 = tfMap?.get('15m') || [];
-      const c1h = tfMap?.get('1H') || [];
-      const c5 = tfMap?.get('5m') || [];
-      const bars = c5.length >= 22 ? c5 : c15;
+      const spread = roundToDecimals(Math.max(0, xau.ask - xau.bid), 2);
+      const cal = this.getEconomicCalendar(activeCfg.newsPauseMinutesBefore ?? 15, activeCfg.newsPauseMinutesAfter ?? 15);
 
-      if (bars.length >= 22) {
-        const spread = roundToDecimals(Math.max(0, xau.ask - xau.bid), 2);
-        const cal = this.getEconomicCalendar(cfg.newsPauseMinutesBefore ?? 15, cfg.newsPauseMinutesAfter ?? 15);
-        const macro = this.getGoldMacro();
-        const prints = this.recentPrints.get('XAU/USD') || [];
-        const buyPrints = prints.filter((p) => p.side === 'BUY').length;
-        const buyPct = prints.length > 0 ? Math.round((buyPrints / prints.length) * 100) : 50;
+      // Anti-Tilt Loss-Streak Cooldown Check
+      const sortedClosed = [...this.serverBot.closedTrades].sort((a, b) => b.closedAt - a.closedAt);
+      let trailingLosses = 0;
+      for (const t of sortedClosed) {
+        if (t.netPnl < 0) trailingLosses += 1;
+        else break;
+      }
+      const antiTiltMs = Math.max(0, activeCfg.antiTiltCooldownMinutes ?? 15) * 60_000;
+      const antiTiltBlocked =
+        trailingLosses >= 2 &&
+        sortedClosed[0] &&
+        now - sortedClosed[0].closedAt < antiTiltMs;
 
-        if ((cfg.useNewsGuard ?? true) && cal.newsGuardActive) {
-          if (now - this.serverBotLastHoldLogAt >= 30_000) {
-            this.serverBotLastHoldLogAt = now;
-            this.appendServerBotLog('RISK', `News Guard paused: ${cal.activeGuardEvent?.title}`);
+      if ((activeCfg.useNewsGuard ?? true) && cal.newsGuardActive) {
+        if (now - this.serverBotLastHoldLogAt >= 30_000) {
+          this.serverBotLastHoldLogAt = now;
+          this.appendServerBotLog('RISK', `News Guard paused: ${cal.activeGuardEvent?.title}`);
+        }
+      } else if ((activeCfg.useSessionSpreadGuard ?? true) && spread > (activeCfg.maxSpreadDollars ?? 1.2)) {
+        if (now - this.serverBotLastHoldLogAt >= 30_000) {
+          this.serverBotLastHoldLogAt = now;
+          this.appendServerBotLog('RISK', `Spread Guard paused: $${spread.toFixed(2)}/oz`);
+        }
+      } else if ((activeCfg.useKillzonesOnly ?? false) && !serverInKillzone(now)) {
+        if (now - this.serverBotLastHoldLogAt >= 60_000) {
+          this.serverBotLastHoldLogAt = now;
+          this.appendServerBotLog('RISK', 'Killzone Guard: outside London/NY Prime hours');
+        }
+      } else if (antiTiltBlocked) {
+        if (now - this.serverBotLastHoldLogAt >= 60_000) {
+          this.serverBotLastHoldLogAt = now;
+          this.appendServerBotLog('RISK', `Anti-Tilt cooldown active after ${trailingLosses} consecutive losses`);
+        }
+      } else {
+        const ema9 = serverEmaLast(bars, 9);
+        const prevEma9 = serverEmaPrev(bars, 9);
+        const ema21 = serverEmaLast(bars, 21);
+        const prevEma21 = serverEmaPrev(bars, 21);
+        const rsi = serverRsiLast(bars, 14);
+        const vwap = serverVwapLast(bars);
+        const atr14 = serverAtr14(bars);
+        const bb = serverBollingerLast(bars, 20);
+        const regime = serverDetectRegime(bars, ema9, ema21, bb.upper, bb.lower, rsi, atr14);
+        const atas = serverAtasBarSignals(bars);
+
+        // ORB levels from recent opening slice
+        const orSlice = bars.slice(Math.max(0, bars.length - 24), Math.max(4, bars.length - 18));
+        const orHigh = orSlice.length > 0 ? Math.max(...orSlice.map((b) => b.high)) : xau.price + 5;
+        const orLow = orSlice.length > 0 ? Math.min(...orSlice.map((b) => b.low)) : xau.price - 5;
+
+        const evalSub = (strat: Exclude<XauBotStrategy, 'SMART_ENSEMBLE'>): {action: 'BUY' | 'SELL' | 'HOLD'; conf: number} => {
+          if (strat === 'ORB_VWAP') {
+            if (xau.price > orHigh && xau.price >= vwap && rsi >= 50 && rsi <= 74) return {action: 'BUY', conf: 72};
+            if (xau.price < orLow && xau.price <= vwap && rsi <= 50 && rsi >= 26) return {action: 'SELL', conf: 72};
+            return {action: 'HOLD', conf: 42};
           }
-        } else if ((cfg.useSessionSpreadGuard ?? true) && spread > (cfg.maxSpreadDollars ?? 1.2)) {
-          if (now - this.serverBotLastHoldLogAt >= 30_000) {
-            this.serverBotLastHoldLogAt = now;
-            this.appendServerBotLog('RISK', `Spread Guard paused: $${spread.toFixed(2)}/oz`);
+          if (strat === 'EMA_MOMENTUM') {
+            const bullCross = prevEma9 <= prevEma21 && ema9 > ema21;
+            const bearCross = prevEma9 >= prevEma21 && ema9 < ema21;
+            if (bullCross || (ema9 > ema21 && xau.price > vwap && rsi >= 52 && rsi <= 72)) {
+              return {action: 'BUY', conf: bullCross ? 84 : 68};
+            }
+            if (bearCross || (ema9 < ema21 && xau.price < vwap && rsi <= 48 && rsi >= 28)) {
+              return {action: 'SELL', conf: bearCross ? 84 : 68};
+            }
+            return {action: 'HOLD', conf: 42};
+          }
+          if (strat === 'BOLLINGER_REVERSION') {
+            if (xau.price <= bb.lower && rsi <= 36) return {action: 'BUY', conf: 78};
+            if (xau.price >= bb.upper && rsi >= 64) return {action: 'SELL', conf: 78};
+            return {action: 'HOLD', conf: 44};
+          }
+          if (strat === 'ORDERFLOW_LIQUIDITY') {
+            if (buyPct >= 56 && xau.price >= vwap) return {action: 'BUY', conf: 72};
+            if (buyPct <= 44 && xau.price <= vwap) return {action: 'SELL', conf: 72};
+            return {action: 'HOLD', conf: 45};
+          }
+          // LIQUIDITY_SWEEP_SMC
+          const lookback = bars.slice(-26, -2);
+          if (lookback.length >= 10) {
+            const swHigh = Math.max(...lookback.map((b) => b.high));
+            const swLow = Math.min(...lookback.map((b) => b.low));
+            const last = bars[bars.length - 1];
+            const prev = bars[bars.length - 2];
+            const minLow = Math.min(last.low, prev.low);
+            const maxHigh = Math.max(last.high, prev.high);
+            if (minLow < swLow - atr14 * 0.08 && last.close > swLow && last.close > last.open) {
+              return {action: 'BUY', conf: atas.absorption === 'BULLISH_ABSORPTION' || atas.cvdDivergence === 'BULLISH' ? 84 : 74};
+            }
+            if (maxHigh > swHigh + atr14 * 0.08 && last.close < swHigh && last.close < last.open) {
+              return {action: 'SELL', conf: atas.absorption === 'BEARISH_ABSORPTION' || atas.cvdDivergence === 'BEARISH' ? 84 : 74};
+            }
+          }
+          return {action: 'HOLD', conf: 42};
+        };
+
+        let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
+        let conf = 45;
+        let usedSubStrategy: XauBotStrategy = activeCfg.strategy;
+
+        if (activeCfg.strategy === 'SMART_ENSEMBLE') {
+          const subs: Array<Exclude<XauBotStrategy, 'SMART_ENSEMBLE'>> = [
+            'ORB_VWAP',
+            'LIQUIDITY_SWEEP_SMC',
+            'ORDERFLOW_LIQUIDITY',
+            'EMA_MOMENTUM',
+            'BOLLINGER_REVERSION',
+          ];
+          const regimeAdj = (s: Exclude<XauBotStrategy, 'SMART_ENSEMBLE'>) => {
+            if (regime === 'TRENDING') return s === 'EMA_MOMENTUM' || s === 'ORB_VWAP' ? 8 : s === 'BOLLINGER_REVERSION' ? -8 : 0;
+            if (regime === 'BREAKOUT') return s === 'ORB_VWAP' || s === 'ORDERFLOW_LIQUIDITY' ? 8 : s === 'BOLLINGER_REVERSION' ? -6 : 0;
+            if (regime === 'RANGING') return s === 'BOLLINGER_REVERSION' || s === 'ORDERFLOW_LIQUIDITY' ? 8 : s === 'EMA_MOMENTUM' ? -6 : 0;
+            return s === 'LIQUIDITY_SWEEP_SMC' || s === 'BOLLINGER_REVERSION' ? 9 : -3;
+          };
+          const res = subs.map((s) => {
+            const r = evalSub(s);
+            return {s, action: r.action, wConf: r.action === 'HOLD' ? r.conf : Math.max(20, Math.min(96, r.conf + regimeAdj(s)))};
+          });
+          const buys = res.filter((r) => r.action === 'BUY').sort((a, b) => b.wConf - a.wConf);
+          const sells = res.filter((r) => r.action === 'SELL').sort((a, b) => b.wConf - a.wConf);
+          if (buys.length > sells.length && buys.length > 0) {
+            action = 'BUY';
+            usedSubStrategy = buys[0].s;
+            conf = buys[0].wConf + (buys.length >= 2 ? Math.min(10, (buys.length - 1) * 5) : 0) - sells.length * 6;
+          } else if (sells.length > buys.length && sells.length > 0) {
+            action = 'SELL';
+            usedSubStrategy = sells[0].s;
+            conf = sells[0].wConf + (sells.length >= 2 ? Math.min(10, (sells.length - 1) * 5) : 0) - buys.length * 6;
           }
         } else {
-          const ema9 = serverEmaLast(bars, 9);
-          const ema21 = serverEmaLast(bars, 21);
-          const rsi = serverRsiLast(bars, 14);
-          let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
-          let conf = 45;
+          const single = evalSub(activeCfg.strategy);
+          action = single.action;
+          conf = single.conf;
+        }
 
-          if (ema9 > ema21 && rsi >= 50 && rsi <= 72) {
-            action = 'BUY';
-            conf = 64;
-          } else if (ema9 < ema21 && rsi <= 50 && rsi >= 28) {
-            action = 'SELL';
-            conf = 64;
-          }
-
-          if (action !== 'HOLD' && (cfg.useOrderFlowConfluence ?? true) && prints.length >= 4) {
+        if (action !== 'HOLD' && (activeCfg.useOrderFlowConfluence ?? true)) {
+          if (prints.length >= 4) {
             if (action === 'BUY' && buyPct >= 56) conf += 8;
             else if (action === 'BUY' && buyPct <= 40) conf -= 14;
             else if (action === 'SELL' && buyPct <= 44) conf += 8;
             else if (action === 'SELL' && buyPct >= 60) conf -= 14;
           }
-
-          if (action !== 'HOLD' && (cfg.useMtfConfluence ?? true) && c15.length >= 22 && c1h.length >= 22) {
-            const e9_15 = serverEmaLast(c15, 9);
-            const e21_15 = serverEmaLast(c15, 21);
-            const e9_1h = serverEmaLast(c1h, 9);
-            const e21_1h = serverEmaLast(c1h, 21);
-            const bull15 = e9_15 > e21_15;
-            const bull1h = e9_1h > e21_1h;
-            if ((action === 'BUY' && bull15 && bull1h) || (action === 'SELL' && !bull15 && !bull1h)) conf += 9;
-            else if ((action === 'BUY' && !bull15 && !bull1h) || (action === 'SELL' && bull15 && bull1h)) conf -= 16;
+          if ((action === 'BUY' && (atas.absorption === 'BULLISH_ABSORPTION' || atas.cvdDivergence === 'BULLISH')) ||
+              (action === 'SELL' && (atas.absorption === 'BEARISH_ABSORPTION' || atas.cvdDivergence === 'BEARISH'))) {
+            conf += 4;
+          } else if ((action === 'BUY' && (atas.absorption === 'BEARISH_ABSORPTION' || atas.cvdDivergence === 'BEARISH')) ||
+                     (action === 'SELL' && (atas.absorption === 'BULLISH_ABSORPTION' || atas.cvdDivergence === 'BULLISH'))) {
+            conf -= 6;
           }
+        }
 
-          if (action !== 'HOLD' && (cfg.useMacroConfluence ?? true)) {
-            if ((action === 'BUY' && macro.macroBias === 'BULLISH') || (action === 'SELL' && macro.macroBias === 'BEARISH')) conf += 6;
-            else if ((action === 'BUY' && macro.macroBias === 'BEARISH') || (action === 'SELL' && macro.macroBias === 'BULLISH')) conf -= 8;
-          }
+        if (action !== 'HOLD' && (activeCfg.useMtfConfluence ?? true) && mtfBull !== null && mtfBear !== null) {
+          if ((action === 'BUY' && mtfBull) || (action === 'SELL' && mtfBear)) conf += 9;
+          else if ((action === 'BUY' && mtfBear) || (action === 'SELL' && mtfBull)) conf -= 16;
+        }
 
-          // Institutional Gold Flow & ATAS Aggressor Filter (PAXG real trades + GVZ volatility + COT/GLD)
-          const instCtx = this.getInstitutionalGold();
-          if (action !== 'HOLD' && (cfg.useOrderFlowConfluence ?? true)) {
-            if (action === 'BUY' && instCtx.paxgBuyPct >= 58 && instCtx.paxgBookBidPct >= 52) {
-              conf += 6;
-            } else if (action === 'BUY' && instCtx.paxgBuyPct <= 38 && instCtx.paxgBookBidPct <= 44) {
-              conf -= 9;
-            } else if (action === 'SELL' && instCtx.paxgBuyPct <= 42 && instCtx.paxgBookBidPct <= 48) {
-              conf += 6;
-            } else if (action === 'SELL' && instCtx.paxgBuyPct >= 62 && instCtx.paxgBookBidPct >= 56) {
-              conf -= 9;
-            }
-          }
-          if (action !== 'HOLD' && (cfg.useMacroConfluence ?? true)) {
-            if ((action === 'BUY' && instCtx.compositeBias === 'BULLISH') || (action === 'SELL' && instCtx.compositeBias === 'BEARISH')) {
-              conf += 4;
-            } else if ((action === 'BUY' && instCtx.compositeBias === 'BEARISH') || (action === 'SELL' && instCtx.compositeBias === 'BULLISH')) {
-              conf -= 4;
-            }
-          }
+        if (action !== 'HOLD' && (activeCfg.useMacroConfluence ?? true)) {
+          if ((action === 'BUY' && macro.macroBias === 'BULLISH') || (action === 'SELL' && macro.macroBias === 'BEARISH')) conf += 6;
+          else if ((action === 'BUY' && macro.macroBias === 'BEARISH') || (action === 'SELL' && macro.macroBias === 'BULLISH')) conf -= 8;
+        }
 
-          const effectiveMinConf = instCtx.volatilityAlert ? Math.min(90, cfg.minConfidence + 5) : cfg.minConfidence;
+        // Institutional Gold Flow & ATAS Aggressor Filter (PAXG real trades + GVZ volatility + COT/GLD)
+        const instCtx = this.getInstitutionalGold();
+        if (action !== 'HOLD' && (activeCfg.useOrderFlowConfluence ?? true)) {
+          if (action === 'BUY' && instCtx.paxgBuyPct >= 58 && instCtx.paxgBookBidPct >= 52) conf += 6;
+          else if (action === 'BUY' && instCtx.paxgBuyPct <= 38 && instCtx.paxgBookBidPct <= 44) conf -= 9;
+          else if (action === 'SELL' && instCtx.paxgBuyPct <= 42 && instCtx.paxgBookBidPct <= 48) conf += 6;
+          else if (action === 'SELL' && instCtx.paxgBuyPct >= 62 && instCtx.paxgBookBidPct >= 56) conf -= 9;
+        }
+        if (action !== 'HOLD' && (activeCfg.useMacroConfluence ?? true)) {
+          if ((action === 'BUY' && instCtx.compositeBias === 'BULLISH') || (action === 'SELL' && instCtx.compositeBias === 'BEARISH')) conf += 4;
+          else if ((action === 'BUY' && instCtx.compositeBias === 'BEARISH') || (action === 'SELL' && instCtx.compositeBias === 'BULLISH')) conf -= 4;
+        }
 
-          if (action !== 'HOLD' && conf >= effectiveMinConf) {
-            const fill = action === 'BUY' ? xau.ask : xau.bid;
-            const sameSide = this.serverBot.positions.filter((p) => p.side === action);
-            const closestDist = sameSide.length > 0 ? Math.min(...sameSide.map((p) => Math.abs(p.entryPrice - fill))) : 999;
+        const effectiveMinConf = instCtx.volatilityAlert ? Math.min(90, activeCfg.minConfidence + 5) : activeCfg.minConfidence;
 
-            if (sameSide.length === 0 || closestDist >= 1.5 || conf >= 76) {
-              const tierIdx = sameSide.length;
-              const tpMult = roundToDecimals(1 + tierIdx * 0.35, 2);
-              const sl = roundToDecimals(action === 'BUY' ? fill - cfg.stopLossDollars : fill + cfg.stopLossDollars, 2);
-              const tp = roundToDecimals(action === 'BUY' ? fill + cfg.takeProfitDollars * tpMult : fill - cfg.takeProfitDollars * tpMult, 2);
-              const trail = tierIdx > 0 ? cfg.trailingStopDollars ?? Math.max(4.5, roundToDecimals(cfg.stopLossDollars * 0.75, 2)) : cfg.trailingStopDollars;
-              const fee = roundToDecimals(cfg.lotSize * xau.commissionPerUnit, 2);
+        if (action !== 'HOLD' && conf >= effectiveMinConf) {
+          const fill = action === 'BUY' ? xau.ask : xau.bid;
+          const sameSide = this.serverBot.positions.filter((p) => p.side === action);
+          const closestDist = sameSide.length > 0 ? Math.min(...sameSide.map((p) => Math.abs(p.entryPrice - fill))) : 999;
 
-              if (!this.brokerOrderInFlight && this.shouldRouteRealBroker()) {
-                this.brokerOrderInFlight = true;
-                void this.routeBrokerOpenOrder({
-                  side: action,
-                  lotSize: cfg.lotSize,
-                  stopLoss: sl,
-                  takeProfit: tp,
-                  estimatedPrice: fill,
-                }).then((brokerRes) => {
-                  this.brokerOrderInFlight = false;
-                  if (!brokerRes.ok) {
-                    this.appendServerBotLog(
-                      'RISK',
-                      `Broker rejected ${action} ${cfg.lotSize} XAU/USD: ${brokerRes.error || 'Unknown error'}`,
-                    );
-                    this.persistServerBotState();
-                    return;
-                  }
-                  const actualFill = brokerRes.fillPrice || fill;
-                  const newPos: Position = {
-                    id: `sbpos-${now}-${Math.random().toString(36).slice(2, 6)}`,
-                    symbol: 'XAU/USD',
-                    side: action,
-                    quantity: cfg.lotSize,
-                    entryPrice: actualFill,
-                    leverage: cfg.leverage,
-                    marginUsed: roundToDecimals((actualFill * cfg.lotSize * xau.contractSize) / cfg.leverage, 2),
-                    stopLoss: sl,
-                    takeProfit: tp,
-                    trailingStopDistance: trail,
-                    peakFavorablePrice: actualFill,
-                    openedAt: now,
-                    commissionPaid: fee,
-                    source: 'XAU_BOT',
-                    botStrategy: cfg.strategy,
-                    botConfidence: conf,
-                    brokerOrderId: brokerRes.brokerTradeId,
-                    brokerProvider: brokerRes.provider,
-                  };
-                  this.serverBot.positions = [newPos, ...this.serverBot.positions];
-                  this.serverBot.executions = [
-                    {
-                      id: `sbex-open-${now}-${Math.random().toString(36).slice(2, 5)}`,
-                      symbol: 'XAU/USD',
-                      side: action,
-                      action: 'OPEN' as const,
-                      quantity: cfg.lotSize,
-                      price: actualFill,
-                      realizedPnl: 0,
-                      fee,
-                      timestamp: now,
-                      source: 'XAU_BOT' as const,
-                      notes: `${brokerRes.provider} #${brokerRes.brokerTradeId || 'LIVE'}`,
-                    },
-                    ...this.serverBot.executions,
-                  ].slice(0, 200);
-                  this.serverBotLastTradeAt = now;
+          if (sameSide.length === 0 || closestDist >= 1.5 || conf >= 76) {
+            const tierIdx = sameSide.length;
+            const tpMult = roundToDecimals(1 + tierIdx * 0.35, 2);
+            const effSl = (activeCfg.useAtrRiskScaling ?? true) && atr14 > 0
+              ? Math.min(22, Math.max(activeCfg.stopLossDollars, roundToDecimals(atr14 * 1.25, 2)))
+              : activeCfg.stopLossDollars;
+            const effTp = Math.max(activeCfg.takeProfitDollars, roundToDecimals(effSl * 1.9, 2));
+
+            // Dynamic Risk-% sizing + Anti-Tilt 50% recovery sizing after >=2 consecutive losses
+            const serverEquity = Math.max(1000, 100_000 + this.serverBot.netPnl);
+            const riskPct = activeCfg.riskPerTradePct ?? 0;
+            let rawLot = riskPct > 0
+              ? (serverEquity * (Math.min(5, riskPct) / 100)) / (effSl * 100)
+              : activeCfg.lotSize;
+            if (trailingLosses >= 2) rawLot *= trailingLosses >= 3 ? 0.5 : 0.65;
+            const effLot = Math.max(0.01, Math.min(5.0, roundToDecimals(rawLot, 2)));
+
+            const sl = roundToDecimals(action === 'BUY' ? fill - effSl : fill + effSl, 2);
+            const tp = roundToDecimals(action === 'BUY' ? fill + effTp * tpMult : fill - effTp * tpMult, 2);
+            const trail = tierIdx > 0 ? activeCfg.trailingStopDollars ?? Math.max(4.5, roundToDecimals(effSl * 0.75, 2)) : activeCfg.trailingStopDollars;
+            const fee = roundToDecimals(effLot * xau.commissionPerUnit, 2);
+
+            if (!this.brokerOrderInFlight && this.shouldRouteRealBroker()) {
+              this.brokerOrderInFlight = true;
+              void this.routeBrokerOpenOrder({
+                side: action,
+                lotSize: effLot,
+                stopLoss: sl,
+                takeProfit: tp,
+                estimatedPrice: fill,
+              }).then((brokerRes) => {
+                this.brokerOrderInFlight = false;
+                if (!brokerRes.ok) {
                   this.appendServerBotLog(
-                    'EXECUTION',
-                    `[${brokerRes.provider}] Opened ${tierIdx > 0 ? `Runner #${tierIdx + 1}` : 'Core #1'} ${action} ${cfg.lotSize} XAU/USD @ ${actualFill.toFixed(2)} (ID ${brokerRes.brokerTradeId || 'OK'})`,
+                    'RISK',
+                    `Broker rejected ${action} ${effLot} XAU/USD: ${brokerRes.error || 'Unknown error'}`,
                   );
                   this.persistServerBotState();
-                });
-              } else if (!this.shouldRouteRealBroker()) {
+                  return;
+                }
+                const actualFill = brokerRes.fillPrice || fill;
                 const newPos: Position = {
                   id: `sbpos-${now}-${Math.random().toString(36).slice(2, 6)}`,
                   symbol: 'XAU/USD',
                   side: action,
-                  quantity: cfg.lotSize,
-                  entryPrice: fill,
-                  leverage: cfg.leverage,
-                  marginUsed: roundToDecimals((fill * cfg.lotSize * xau.contractSize) / cfg.leverage, 2),
+                  quantity: effLot,
+                  entryPrice: actualFill,
+                  leverage: activeCfg.leverage,
+                  marginUsed: roundToDecimals((actualFill * effLot * xau.contractSize) / activeCfg.leverage, 2),
                   stopLoss: sl,
                   takeProfit: tp,
                   trailingStopDistance: trail,
-                  peakFavorablePrice: fill,
+                  peakFavorablePrice: actualFill,
                   openedAt: now,
                   commissionPaid: fee,
                   source: 'XAU_BOT',
-                  botStrategy: cfg.strategy,
+                  botStrategy: usedSubStrategy,
                   botConfidence: conf,
-                  brokerProvider: 'SIMULATION',
+                  brokerOrderId: brokerRes.brokerTradeId,
+                  brokerProvider: brokerRes.provider,
                 };
                 this.serverBot.positions = [newPos, ...this.serverBot.positions];
                 this.serverBot.executions = [
@@ -1600,23 +1921,66 @@ class LiveMarketEngine {
                     symbol: 'XAU/USD',
                     side: action,
                     action: 'OPEN' as const,
-                    quantity: cfg.lotSize,
-                    price: fill,
+                    quantity: effLot,
+                    price: actualFill,
                     realizedPnl: 0,
                     fee,
                     timestamp: now,
                     source: 'XAU_BOT' as const,
-                    notes: `24/7 Server ${tierIdx > 0 ? `Runner #${tierIdx + 1}` : 'Core #1'}`,
+                    notes: `${brokerRes.provider} #${brokerRes.brokerTradeId || 'LIVE'} (${usedSubStrategy})`,
                   },
                   ...this.serverBot.executions,
                 ].slice(0, 200);
                 this.serverBotLastTradeAt = now;
                 this.appendServerBotLog(
                   'EXECUTION',
-                  `Opened ${tierIdx > 0 ? `Runner #${tierIdx + 1}` : 'Core #1'} ${action} ${cfg.lotSize} XAU/USD @ ${fill.toFixed(2)} (SL ${sl.toFixed(2)} / TP ${tp.toFixed(2)})`,
+                  `[${brokerRes.provider}] Opened ${tierIdx > 0 ? `Runner #${tierIdx + 1}` : 'Core #1'} ${action} ${effLot} XAU/USD @ ${actualFill.toFixed(2)} [${regime} · ${usedSubStrategy}]`,
                 );
-                stateDirty = true;
-              }
+                this.persistServerBotState();
+              });
+            } else if (!this.shouldRouteRealBroker()) {
+              const newPos: Position = {
+                id: `sbpos-${now}-${Math.random().toString(36).slice(2, 6)}`,
+                symbol: 'XAU/USD',
+                side: action,
+                quantity: effLot,
+                entryPrice: fill,
+                leverage: activeCfg.leverage,
+                marginUsed: roundToDecimals((fill * effLot * xau.contractSize) / activeCfg.leverage, 2),
+                stopLoss: sl,
+                takeProfit: tp,
+                trailingStopDistance: trail,
+                peakFavorablePrice: fill,
+                openedAt: now,
+                commissionPaid: fee,
+                source: 'XAU_BOT',
+                botStrategy: usedSubStrategy,
+                botConfidence: conf,
+                brokerProvider: 'SIMULATION',
+              };
+              this.serverBot.positions = [newPos, ...this.serverBot.positions];
+              this.serverBot.executions = [
+                {
+                  id: `sbex-open-${now}-${Math.random().toString(36).slice(2, 5)}`,
+                  symbol: 'XAU/USD',
+                  side: action,
+                  action: 'OPEN' as const,
+                  quantity: effLot,
+                  price: fill,
+                  realizedPnl: 0,
+                  fee,
+                  timestamp: now,
+                  source: 'XAU_BOT' as const,
+                  notes: `24/7 Server ${tierIdx > 0 ? `Runner #${tierIdx + 1}` : 'Core #1'} (${usedSubStrategy})`,
+                },
+                ...this.serverBot.executions,
+              ].slice(0, 200);
+              this.serverBotLastTradeAt = now;
+              this.appendServerBotLog(
+                'EXECUTION',
+                `Opened ${tierIdx > 0 ? `Runner #${tierIdx + 1}` : 'Core #1'} ${action} ${effLot} XAU/USD @ ${fill.toFixed(2)} [${regime} · ${usedSubStrategy}] (SL ${sl.toFixed(2)} / TP ${tp.toFixed(2)})`,
+              );
+              stateDirty = true;
             }
           }
         }

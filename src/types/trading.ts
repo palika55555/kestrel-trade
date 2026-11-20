@@ -103,6 +103,7 @@ export type ExecutionAction =
   | 'STOP_LOSS'
   | 'TAKE_PROFIT'
   | 'TRAILING_STOP'
+  | 'EARLY_EXIT'
   | 'LIQUIDATION';
 
 export interface TradeExecution {
@@ -221,11 +222,19 @@ export interface StagedOrderPreset {
   nonce: number;
 }
 
+export type GoldMarketRegime =
+  | 'TRENDING'
+  | 'BREAKOUT'
+  | 'RANGING'
+  | 'VOLATILE_REVERSAL';
+
 export type XauBotStrategy =
+  | 'SMART_ENSEMBLE'
   | 'ORB_VWAP'
+  | 'LIQUIDITY_SWEEP_SMC'
+  | 'ORDERFLOW_LIQUIDITY'
   | 'EMA_MOMENTUM'
-  | 'BOLLINGER_REVERSION'
-  | 'ORDERFLOW_LIQUIDITY';
+  | 'BOLLINGER_REVERSION';
 
 export interface XauBotConfig {
   enabled: boolean;
@@ -235,6 +244,11 @@ export interface XauBotConfig {
   useMacroConfluence: boolean;
   useSessionSpreadGuard: boolean;
   useNewsGuard: boolean;
+  useKillzonesOnly?: boolean;
+  useAtrRiskScaling?: boolean;
+  riskPerTradePct?: number; // 0 = fixed lotSize, >0 = equity % risk per trade
+  antiTiltCooldownMinutes?: number; // pause after >=2 consecutive losses
+  staleTradeMinutes?: number; // early exit time-stop if stagnant & opposite confluence
   newsPauseMinutesBefore: number;
   newsPauseMinutesAfter: number;
   maxSpreadDollars: number;
@@ -250,6 +264,29 @@ export interface XauBotConfig {
   cooldownSeconds: number;
   maxDailyLossDollars: number;
   minConfidence: number;
+}
+
+export interface BacktestStrategyResult {
+  strategy: XauBotStrategy;
+  label: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  netPnl: number;
+  profitFactor: number;
+  maxDrawdown: number;
+  expectancy: number;
+  equityCurve: number[];
+}
+
+export interface BacktestReport {
+  symbol: string;
+  barsTested: number;
+  timeframeLabel: string;
+  results: BacktestStrategyResult[];
+  recommendedStrategy: XauBotStrategy;
+  generatedAt: number;
 }
 
 export interface XauBotLogEntry {

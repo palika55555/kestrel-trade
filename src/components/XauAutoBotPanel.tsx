@@ -612,6 +612,16 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
                     )}
                   </>
                 )}
+                <span>Regime: {evaluation.regime}</span>
+                <span>
+                  Eff SL ${evaluation.effectiveSlDollars.toFixed(1)} · Lot{' '}
+                  {evaluation.effectiveLotSize.toFixed(2)}
+                </span>
+                {evaluation.antiTilt.trailingLosses >= 2 && (
+                  <span className="text-amber-500 font-semibold">
+                    Anti-Tilt {evaluation.antiTilt.active ? 'Cooldown' : 'Half-Lot Recovery'}
+                  </span>
+                )}
               </div>
             )}
           </div>
@@ -653,7 +663,9 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
             }
             className="w-full rounded-lg border border-slate-200 dark:border-[#242E42] bg-slate-50 dark:bg-[#0D1119] px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100"
           >
+            <option value="SMART_ENSEMBLE">Smart Regime Ensemble (Multi-Strategy)</option>
             <option value="ORB_VWAP">ORB Breakout + VWAP Confluence</option>
+            <option value="LIQUIDITY_SWEEP_SMC">Liquidity Sweep + FVG Reversal</option>
             <option value="ORDERFLOW_LIQUIDITY">Order Flow + POC / Liquidity</option>
             <option value="EMA_MOMENTUM">EMA 9/21 + VWAP + RSI Momentum</option>
             <option value="BOLLINGER_REVERSION">Bollinger + RSI Mean Reversion</option>
@@ -857,6 +869,92 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
               : 'Single-trade mode'}
           </div>
         </div>
+
+        <div>
+          <label className="block text-[11px] text-slate-500 dark:text-slate-400 mb-1">
+            Risk % / Trade (0=Fixed)
+          </label>
+          <input
+            type="number"
+            min={0}
+            max={5}
+            step={0.25}
+            value={config.riskPerTradePct ?? 0}
+            onChange={(e) =>
+              onUpdateConfig({
+                ...config,
+                riskPerTradePct: Math.max(0, Math.min(5, Number(e.target.value) || 0)),
+              })
+            }
+            className="w-full rounded-lg border border-slate-200 dark:border-[#242E42] bg-slate-50 dark:bg-[#0D1119] px-2.5 py-1.5 font-mono text-slate-900 dark:text-slate-100"
+          />
+        </div>
+
+        <div>
+          <label className="block text-[11px] text-slate-500 dark:text-slate-400 mb-1">
+            Time-Stop Exit (min, 0=Off)
+          </label>
+          <input
+            type="number"
+            min={0}
+            max={240}
+            step={5}
+            value={config.staleTradeMinutes ?? 45}
+            onChange={(e) =>
+              onUpdateConfig({
+                ...config,
+                staleTradeMinutes: Math.max(0, Math.min(240, Number(e.target.value) || 0)),
+              })
+            }
+            className="w-full rounded-lg border border-slate-200 dark:border-[#242E42] bg-slate-50 dark:bg-[#0D1119] px-2.5 py-1.5 font-mono text-slate-900 dark:text-slate-100"
+          />
+        </div>
+
+        <button
+          type="button"
+          onClick={() =>
+            onUpdateConfig({
+              ...config,
+              useAtrRiskScaling: !(config.useAtrRiskScaling ?? true),
+            })
+          }
+          className={`text-left rounded-lg border px-2.5 py-1.5 transition-colors cursor-pointer ${
+            (config.useAtrRiskScaling ?? true)
+              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+              : 'border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] text-slate-500 dark:text-slate-400'
+          }`}
+        >
+          <div className="flex items-center justify-between text-[11px] font-semibold">
+            <span>ATR Dynamic SL/TP</span>
+            <span className="font-mono">{(config.useAtrRiskScaling ?? true) ? 'ON' : 'OFF'}</span>
+          </div>
+          <div className="text-[10px] font-mono opacity-80 truncate">
+            Wick-proof stop buffer
+          </div>
+        </button>
+
+        <button
+          type="button"
+          onClick={() =>
+            onUpdateConfig({
+              ...config,
+              useKillzonesOnly: !(config.useKillzonesOnly ?? false),
+            })
+          }
+          className={`text-left rounded-lg border px-2.5 py-1.5 transition-colors cursor-pointer ${
+            (config.useKillzonesOnly ?? false)
+              ? 'border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-300'
+              : 'border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] text-slate-500 dark:text-slate-400'
+          }`}
+        >
+          <div className="flex items-center justify-between text-[11px] font-semibold">
+            <span>Killzones Only</span>
+            <span className="font-mono">{(config.useKillzonesOnly ?? false) ? 'ON' : 'OFF'}</span>
+          </div>
+          <div className="text-[10px] font-mono opacity-80 truncate">
+            LDN/NY Prime Hours
+          </div>
+        </button>
       </div>
 
       {circuitBreakerHit && (

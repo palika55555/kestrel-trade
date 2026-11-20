@@ -12,19 +12,25 @@ import {
 import {computeUnrealizedPnl, formatCurrency, formatPrice} from '../services/tradingMath';
 import {
   computeXauBotStats,
+  runWalkForwardBacktest,
   STRATEGY_LABELS,
   type BotEquityPoint,
 } from '../services/xauBot';
 import type {
+  BacktestReport,
+  Candle,
   Instrument,
   Position,
   XauBotAdaptationEvent,
   XauBotConfig,
+  XauBotStrategy,
   XauBotTradeRecord,
 } from '../types/trading';
 
 interface BotStatsViewProps {
   xauInstrument: Instrument | null;
+  xauCandles?: Candle[];
+  timeframeLabel?: string;
   config: XauBotConfig;
   closedTrades: XauBotTradeRecord[];
   openBotPositions: Position[];
@@ -32,6 +38,7 @@ interface BotStatsViewProps {
   isOnline: boolean;
   onToggleBot: () => void;
   onToggleAutoLearn: () => void;
+  onSelectStrategy?: (strategy: XauBotStrategy) => void;
   onOptimizeNow: () => void;
   onResetLearnedParams: () => void;
   onClosePosition: (positionId: string) => void;
@@ -50,6 +57,8 @@ function formatDuration(ms: number): string {
 
 export const BotStatsView: React.FC<BotStatsViewProps> = ({
   xauInstrument,
+  xauCandles = [],
+  timeframeLabel = '15m',
   config,
   closedTrades,
   openBotPositions,
@@ -57,6 +66,7 @@ export const BotStatsView: React.FC<BotStatsViewProps> = ({
   isOnline,
   onToggleBot,
   onToggleAutoLearn,
+  onSelectStrategy,
   onOptimizeNow,
   onResetLearnedParams,
   onClosePosition,
@@ -64,6 +74,7 @@ export const BotStatsView: React.FC<BotStatsViewProps> = ({
 }) => {
   const [tradeFilter, setTradeFilter] = useState<'ALL' | 'WIN' | 'LOSS' | 'OPEN'>('ALL');
   const [hoveredPoint, setHoveredPoint] = useState<BotEquityPoint | null>(null);
+  const [backtestReport, setBacktestReport] = useState<BacktestReport | null>(null);
 
   const stats = useMemo(
     () => computeXauBotStats(closedTrades, openBotPositions, xauInstrument),
@@ -518,6 +529,123 @@ export const BotStatsView: React.FC<BotStatsViewProps> = ({
             </div>
           )}
         </div>
+      </div>
+
+      {/* Walk-Forward Strategy Backtester */}
+      <div className="rounded-xl border border-slate-200 dark:border-[#1E2636] bg-white dark:bg-[#121721] p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 dark:border-[#1E2636] pb-3">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
+              Walk-Forward Strategy Backtester (Live Historical Candles)
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Zero-lookahead simulation across all 6 strategies on real {timeframeLabel} XAU/USD candles ({xauCandles.length} bars) including spread, fees, ATR SL/TP &amp; Auto BE.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={!xauInstrument || xauCandles.length < 35}
+            onClick={() => {
+              if (!xauInstrument || xauCandles.length < 35) return;
+              setBacktestReport(
+                runWalkForwardBacktest(xauInstrument, xauCandles, config, timeframeLabel),
+              );
+            }}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-40 cursor-pointer transition-colors"
+          >
+            <Play className="w-3.5 h-3.5" />
+            <span>Run Backtest ({xauCandles.length} bars)</span>
+          </button>
+        </div>
+
+        {backtestReport ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-slate-200 dark:border-[#1E2636] text-left text-[11px] text-slate-500 dark:text-slate-400">
+                  <th className="py-2 pr-2 font-medium">Strategy</th>
+                  <th className="py-2 px-2 font-medium text-right">Trades</th>
+                  <th className="py-2 px-2 font-medium text-right">Win %</th>
+                  <th className="py-2 px-2 font-medium text-right">Profit Factor</th>
+                  <th className="py-2 px-2 font-medium text-right">Max DD</th>
+                  <th className="py-2 px-2 font-medium text-right">Expectancy</th>
+                  <th className="py-2 px-2 font-medium text-right">Sim Net P&amp;L</th>
+                  <th className="py-2 pl-2 font-medium text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-[#1A2130]">
+                {[...backtestReport.results]
+                  .sort((a, b) => b.netPnl - a.netPnl)
+                  .map((row) => {
+                    const isRec = row.strategy === backtestReport.recommendedStrategy;
+                    const isActive = row.strategy === config.strategy;
+                    return (
+                      <tr key={row.strategy}>
+                        <td className="py-2 pr-2">
+                          <div className="font-medium text-slate-900 dark:text-slate-100">
+                            {row.label}
+                          </div>
+                          {isRec && (
+                            <div className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400">
+                              Recommended on {backtestReport.barsTested}×{backtestReport.timeframeLabel}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2 px-2 text-right font-mono tabular-nums text-slate-600 dark:text-slate-300">
+                          {row.trades} ({row.wins}W/{row.losses}L)
+                        </td>
+                        <td className="py-2 px-2 text-right font-mono tabular-nums text-slate-700 dark:text-slate-200">
+                          {row.trades > 0 ? `${row.winRate}%` : '--'}
+                        </td>
+                        <td className="py-2 px-2 text-right font-mono tabular-nums text-slate-700 dark:text-slate-200">
+                          {row.trades > 0 ? row.profitFactor.toFixed(2) : '--'}
+                        </td>
+                        <td className="py-2 px-2 text-right font-mono tabular-nums text-rose-600 dark:text-rose-400">
+                          -{formatCurrency(row.maxDrawdown)}
+                        </td>
+                        <td
+                          className={`py-2 px-2 text-right font-mono tabular-nums ${
+                            row.expectancy >= 0
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : 'text-rose-600 dark:text-rose-400'
+                          }`}
+                        >
+                          {row.expectancy >= 0 ? '+' : ''}
+                          {formatCurrency(row.expectancy)}
+                        </td>
+                        <td
+                          className={`py-2 px-2 text-right font-mono font-semibold tabular-nums ${
+                            row.netPnl >= 0
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : 'text-rose-600 dark:text-rose-400'
+                          }`}
+                        >
+                          {row.netPnl >= 0 ? '+' : ''}
+                          {formatCurrency(row.netPnl)}
+                        </td>
+                        <td className="py-2 pl-2 text-right">
+                          {onSelectStrategy && (
+                            <button
+                              type="button"
+                              disabled={isActive}
+                              onClick={() => onSelectStrategy(row.strategy)}
+                              className="px-2 py-1 text-[11px] font-medium rounded border border-slate-200 dark:border-[#263042] text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-[#1B2232] disabled:opacity-40 cursor-pointer"
+                            >
+                              {isActive ? 'Active' : 'Use'}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="text-xs text-slate-500 dark:text-slate-400 py-1">
+            Click &quot;Run Backtest&quot; to test which strategy &amp; confluence performs best on the current XAU/USD market structure before trading live.
+          </div>
+        )}
       </div>
 
       {/* Bot Trade Ledger (Open + Closed Trades with Earned / Lost Result) */}

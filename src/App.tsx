@@ -52,6 +52,8 @@ import {
   createDefaultXauBotConfig,
   evaluateMultiTradeEntry,
   evaluateXauBotSignal,
+  shouldEarlyExitPosition,
+  type XauBotEvaluation,
 } from './services/xauBot';
 import type {
   ActiveTab,
@@ -343,6 +345,7 @@ export default function App() {
   institutionalGoldRef.current = institutionalGold;
   const calendarSnapshotRef = useRef(calendarSnapshot);
   calendarSnapshotRef.current = calendarSnapshot;
+  const latestXauEvalRef = useRef<XauBotEvaluation | null>(null);
   const server247EnabledRef = useRef(server247Enabled);
   server247EnabledRef.current = server247Enabled;
   const seenMachineIdsRef = useRef<Set<string>>(new Set());
@@ -912,6 +915,24 @@ export default function App() {
               if (hitTP) triggerAction = 'TAKE_PROFIT';
             }
 
+            if (
+              !triggerAction &&
+              updatedPos.source === 'XAU_BOT' &&
+              updatedPos.symbol === 'XAU/USD'
+            ) {
+              const earlyRes = shouldEarlyExitPosition(
+                updatedPos,
+                exitMark,
+                inst.contractSize,
+                latestXauEvalRef.current,
+                xauBotConfigRef.current.staleTradeMinutes ?? 45,
+                payload.timestamp,
+              );
+              if (earlyRes.exit) {
+                triggerAction = 'EARLY_EXIT';
+              }
+            }
+
             if (triggerAction) {
               modified = true;
               const pnl = computeUnrealizedPnl(updatedPos, inst);
@@ -1185,6 +1206,8 @@ export default function App() {
                   macro: goldMacroRef.current,
                   institutional: institutionalGoldRef.current,
                   calendar: calendarSnapshotRef.current,
+                  closedTrades: xauBotTradesRef.current,
+                  accountEquity: cashBalanceRef.current,
                   nowMs,
                 },
               );
@@ -1217,9 +1240,11 @@ export default function App() {
                       );
                     }
                   } else {
+                    const tradeLot = evalRes.effectiveLotSize || botCfg.lotSize;
+                    const usedStrategy = evalRes.selectedSubStrategy || botCfg.strategy;
                     const marginUsed = computeRequiredMargin(
                       fillPrice,
-                      botCfg.lotSize,
+                      tradeLot,
                       botCfg.leverage,
                       xauInst,
                     );
@@ -1237,7 +1262,7 @@ export default function App() {
                     if (marginUsed <= estFreeMargin) {
                       xauBotLastTradeRef.current = nowMs;
                       const fee = Number(
-                        (botCfg.lotSize * xauInst.commissionPerUnit).toFixed(2),
+                        (tradeLot * xauInst.commissionPerUnit).toFixed(2),
                       );
                       const tierLabel = multiPlan.isRunner
                         ? `Runner #${multiPlan.tierNumber} (${multiPlan.tpMultiplier}x TP)`
@@ -1246,7 +1271,7 @@ export default function App() {
                         id: `pos-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
                         symbol: 'XAU/USD',
                         side: evalRes.action,
-                        quantity: botCfg.lotSize,
+                        quantity: tradeLot,
                         entryPrice: fillPrice,
                         leverage: botCfg.leverage,
                         marginUsed,
@@ -1257,7 +1282,7 @@ export default function App() {
                         openedAt: nowMs,
                         commissionPaid: fee,
                         source: 'XAU_BOT',
-                        botStrategy: botCfg.strategy,
+                        botStrategy: usedStrategy,
                         botConfidence: evalRes.confidence,
                       };
                       const newExec: TradeExecution = {
@@ -1265,20 +1290,20 @@ export default function App() {
                         symbol: 'XAU/USD',
                         side: evalRes.action,
                         action: 'OPEN',
-                        quantity: botCfg.lotSize,
+                        quantity: tradeLot,
                         price: fillPrice,
                         realizedPnl: 0,
                         fee,
                         timestamp: nowMs,
                         source: 'XAU_BOT',
-                        notes: `XAU Bot ${tierLabel} (${botCfg.strategy}) · ${evalRes.reason}`,
+                        notes: `XAU Bot ${tierLabel} (${usedStrategy}) · ${evalRes.reason}`,
                       };
                       setPositions((prev) => [newPos, ...prev]);
                       setExecutions((prev) => [newExec, ...prev]);
                       setCashBalance((c) => Number((c - fee).toFixed(2)));
                       appendBotLog(
                         'EXECUTION',
-                        `Opened ${tierLabel} ${evalRes.action} ${botCfg.lotSize} XAU/USD @ ${formatPrice(
+                        `Opened ${tierLabel} ${evalRes.action} ${tradeLot} XAU/USD @ ${formatPrice(
                           fillPrice,
                           2,
                         )} (SL ${formatPrice(multiPlan.stopLoss, 2)} / TP ${formatPrice(
@@ -1292,7 +1317,7 @@ export default function App() {
                       );
                       emitNotification(
                         `XAU Bot ${tierLabel} ${evalRes.action}`,
-                        `${botCfg.lotSize} lots XAU/USD @ ${formatPrice(
+                        `${tradeLot} lots XAU/USD @ ${formatPrice(
                           fillPrice,
                           2,
                         )} · SL ${formatPrice(multiPlan.stopLoss, 2)} · TP ${formatPrice(
@@ -1454,6 +1479,14 @@ export default function App() {
     [server247Enabled, serverBotState, xauBotConfig],
   );
 
+  const activeBotTrades = useMemo(
+    () =>
+      server247Enabled && serverBotState
+        ? serverBotState.closedTrades
+        : xauBotTrades,
+    [server247Enabled, serverBotState, xauBotTrades],
+  );
+
   const xauBotEvaluation = useMemo(() => {
     if (!xauInstrument) return null;
     const rawCandles =
@@ -1473,6 +1506,8 @@ export default function App() {
         macro: goldMacro,
         institutional: institutionalGold,
         calendar: calendarSnapshot,
+        closedTrades: activeBotTrades,
+        accountEquity: cashBalance,
       },
     );
   }, [
@@ -1488,7 +1523,10 @@ export default function App() {
     goldMacro,
     institutionalGold,
     calendarSnapshot,
+    activeBotTrades,
+    cashBalance,
   ]);
+  latestXauEvalRef.current = xauBotEvaluation;
 
   const botPositions = useMemo(() => {
     if (server247Enabled && serverBotState) {
@@ -1508,14 +1546,6 @@ export default function App() {
     () =>
       server247Enabled && serverBotState ? serverBotState.logs : xauBotLogs,
     [server247Enabled, serverBotState, xauBotLogs],
-  );
-
-  const activeBotTrades = useMemo(
-    () =>
-      server247Enabled && serverBotState
-        ? serverBotState.closedTrades
-        : xauBotTrades,
-    [server247Enabled, serverBotState, xauBotTrades],
   );
 
   const allPositions = useMemo(() => {
@@ -2967,6 +2997,12 @@ export default function App() {
         {activeTab === 'bot' && (
           <BotStatsView
             xauInstrument={xauInstrument}
+            xauCandles={
+              selectedSymbol === 'XAU/USD' && candles.length >= 22
+                ? candles
+                : candlesBySymbol['XAU/USD'] || xauMtfCandles['15m'] || []
+            }
+            timeframeLabel={selectedSymbol === 'XAU/USD' ? timeframe : '15m'}
             config={activeBotConfig}
             closedTrades={activeBotTrades}
             openBotPositions={botPositions}
@@ -2989,6 +3025,10 @@ export default function App() {
                 'LEARN',
                 `Automatic self-learning ${next ? 'ENABLED' : 'DISABLED'}.`,
               );
+            }}
+            onSelectStrategy={async (strategy) => {
+              await syncConfigToBot({...activeBotConfig, strategy});
+              appendBotLog('LEARN', `Backtest applied strategy: ${strategy}`);
             }}
             onOptimizeNow={() => recordClosedBotTradesAndLearn([], true)}
             onResetLearnedParams={() => {

@@ -9,9 +9,12 @@ import {
   formatPrice,
 } from './tradingMath';
 import type {
+  BacktestReport,
+  BacktestStrategyResult,
   Candle,
   EconomicCalendarSnapshot,
   EconomicEvent,
+  GoldMarketRegime,
   InstitutionalGoldContext,
   Instrument,
   MacroGoldContext,
@@ -37,12 +40,17 @@ export function createDefaultXauBotConfig(): XauBotConfig {
     useMacroConfluence: true,
     useSessionSpreadGuard: true,
     useNewsGuard: true,
+    useKillzonesOnly: false,
+    useAtrRiskScaling: true,
+    riskPerTradePct: 0,
+    antiTiltCooldownMinutes: 15,
+    staleTradeMinutes: 45,
     newsPauseMinutesBefore: 15,
     newsPauseMinutesAfter: 15,
     maxSpreadDollars: 1.2,
     autoBreakEvenEnabled: true,
     partialTpEnabled: true,
-    strategy: 'ORB_VWAP',
+    strategy: 'SMART_ENSEMBLE',
     lotSize: 0.1,
     leverage: 15,
     stopLossDollars: 8.0,
@@ -280,10 +288,162 @@ export function computeMtfTrends(
   return {trends, overallBias};
 }
 
+export interface AntiTiltStatus {
+  active: boolean;
+  trailingLosses: number;
+  cooldownRemainingSec: number;
+  defensiveLotMultiplier: number;
+}
+
+export function isInsideLondonOrNyKillzone(nowMs: number = Date.now()): {
+  inKillzone: boolean;
+  label: string;
+} {
+  const d = new Date(nowMs);
+  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  // London Open Killzone: 07:00 - 11:00 UTC
+  if (mins >= 420 && mins <= 660) {
+    return {inKillzone: true, label: 'London Killzone'};
+  }
+  // NY Open & Overlap Killzone: 12:30 - 17:30 UTC
+  if (mins >= 750 && mins <= 1050) {
+    return {inKillzone: true, label: 'NY Open Killzone'};
+  }
+  return {inKillzone: false, label: 'Off-Killzone'};
+}
+
+export function checkAntiTiltState(
+  closedTrades: XauBotTradeRecord[],
+  config: XauBotConfig,
+  nowMs: number = Date.now(),
+): AntiTiltStatus {
+  if (!closedTrades || closedTrades.length === 0) {
+    return {active: false, trailingLosses: 0, cooldownRemainingSec: 0, defensiveLotMultiplier: 1};
+  }
+  const sorted = [...closedTrades].sort((a, b) => b.closedAt - a.closedAt);
+  let trailingLosses = 0;
+  for (const t of sorted) {
+    if (t.netPnl < 0) trailingLosses += 1;
+    else break;
+  }
+  if (trailingLosses < 2) {
+    return {active: false, trailingLosses, cooldownRemainingSec: 0, defensiveLotMultiplier: 1};
+  }
+  const cooldownMin = Math.max(0, config.antiTiltCooldownMinutes ?? 15);
+  const lastLossAt = sorted[0].closedAt;
+  const elapsedMs = Math.max(0, nowMs - lastLossAt);
+  const cooldownMs = cooldownMin * 60_000;
+  const remainingSec = elapsedMs < cooldownMs ? Math.ceil((cooldownMs - elapsedMs) / 1000) : 0;
+
+  return {
+    active: remainingSec > 0,
+    trailingLosses,
+    cooldownRemainingSec: remainingSec,
+    defensiveLotMultiplier: trailingLosses >= 3 ? 0.5 : 0.65,
+  };
+}
+
+export function computeEffectiveBotLot(
+  config: XauBotConfig,
+  effectiveSlDollars: number,
+  accountEquity: number,
+  closedTrades: XauBotTradeRecord[] = [],
+  nowMs: number = Date.now(),
+): number {
+  const antiTilt = checkAntiTiltState(closedTrades, config, nowMs);
+  const riskPct = config.riskPerTradePct ?? 0;
+  let baseLot = config.lotSize;
+  if (riskPct > 0 && accountEquity > 0 && effectiveSlDollars > 0) {
+    const riskDollars = accountEquity * (Math.min(5, riskPct) / 100);
+    // 1.0 lot XAU/USD = 100 oz -> $100 per $1 move
+    baseLot = riskDollars / (effectiveSlDollars * 100);
+  }
+  const adjusted = baseLot * antiTilt.defensiveLotMultiplier;
+  return Math.max(0.01, Math.min(5.0, Math.round(adjusted * 100) / 100));
+}
+
+export function shouldEarlyExitPosition(
+  pos: Position,
+  markPrice: number,
+  contractSize: number,
+  evaluation: XauBotEvaluation | null,
+  staleTradeMinutes: number = 45,
+  nowMs: number = Date.now(),
+): {exit: boolean; reason?: string} {
+  if (!evaluation || staleTradeMinutes <= 0) return {exit: false};
+  const heldMs = nowMs - pos.openedAt;
+  if (heldMs < staleTradeMinutes * 60_000) return {exit: false};
+
+  const diff = pos.side === 'BUY' ? markPrice - pos.entryPrice : pos.entryPrice - markPrice;
+  const unrealGross = diff * pos.quantity * contractSize;
+  if (unrealGross >= 0) return {exit: false}; // Let runners & breakeven trades breathe
+
+  const oppositeAction = pos.side === 'BUY' ? 'SELL' : 'BUY';
+  const oppositeMtf = pos.side === 'BUY' ? 'BEARISH' : 'BULLISH';
+
+  if (evaluation.action === oppositeAction && evaluation.confidence >= 64) {
+    return {
+      exit: true,
+      reason: `Early Exit (${Math.round(heldMs / 60_000)}m stagnant): signal flipped ${oppositeAction} (${evaluation.confidence}%)`,
+    };
+  }
+  if (
+    evaluation.mtfBias === oppositeMtf &&
+    evaluation.orderFlow &&
+    ((pos.side === 'BUY' && evaluation.orderFlow.buyPressurePct <= 42) ||
+      (pos.side === 'SELL' && evaluation.orderFlow.buyPressurePct >= 58))
+  ) {
+    return {
+      exit: true,
+      reason: `Time-Stop (${Math.round(heldMs / 60_000)}m): MTF & Order Flow turned ${oppositeMtf}`,
+    };
+  }
+  return {exit: false};
+}
+
+export function detectGoldMarketRegime(
+  candles: Candle[],
+  ema9: number,
+  ema21: number,
+  bbUpper: number,
+  bbLower: number,
+  rsi14: number,
+  atr14: number,
+): GoldMarketRegime {
+  if (candles.length < 18) return 'RANGING';
+  const slice = candles.slice(-15);
+  const netMove = Math.abs(slice[slice.length - 1].close - slice[0].close);
+  let pathSum = 0;
+  for (let i = 1; i < slice.length; i++) {
+    pathSum += Math.abs(slice[i].close - slice[i - 1].close);
+  }
+  const efficiencyRatio = pathSum > 0 ? netMove / pathSum : 0;
+  const price = slice[slice.length - 1].close || 1;
+  const bbWidthPct = ((bbUpper - bbLower) / price) * 100;
+  const emaGap = Math.abs(ema9 - ema21);
+
+  if ((rsi14 >= 70 || rsi14 <= 30) && bbWidthPct >= 0.45) {
+    return 'VOLATILE_REVERSAL';
+  }
+  if (efficiencyRatio >= 0.42 && emaGap >= Math.max(0.4, atr14 * 0.28)) {
+    return 'TRENDING';
+  }
+  if (bbWidthPct <= 0.32 || (efficiencyRatio >= 0.34 && netMove >= atr14 * 1.4)) {
+    return 'BREAKOUT';
+  }
+  return 'RANGING';
+}
+
 export interface XauBotEvaluation {
   action: 'BUY' | 'SELL' | 'HOLD';
   confidence: number;
   reason: string;
+  selectedSubStrategy?: XauBotStrategy;
+  regime: GoldMarketRegime;
+  effectiveSlDollars: number;
+  effectiveTpDollars: number;
+  effectiveLotSize: number;
+  antiTilt: AntiTiltStatus;
   stopLoss: number;
   takeProfit: number;
   indicators: {
@@ -339,6 +499,8 @@ export function evaluateXauBotSignal(
     macro?: MacroGoldContext | null;
     institutional?: InstitutionalGoldContext | null;
     calendar?: EconomicCalendarSnapshot | null;
+    closedTrades?: XauBotTradeRecord[];
+    accountEquity?: number;
     nowMs?: number;
   },
 ): XauBotEvaluation | null {
@@ -372,124 +534,253 @@ export function evaluateXauBotSignal(
     instCtx,
   );
 
-  let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
-  let confidence = 40;
-  let reason = 'Monitoring live XAU/USD ticks...';
+  const atrEst = flow?.atr14 && flow.atr14 > 0 ? flow.atr14 : 2.2;
+  const regime = detectGoldMarketRegime(
+    candles,
+    ema9,
+    ema21,
+    bbUpper,
+    bbLower,
+    rsi14,
+    atrEst,
+  );
+  const nowMs = context?.nowMs ?? Date.now();
+  const antiTilt = checkAntiTiltState(context?.closedTrades ?? [], config, nowMs);
 
-  if (config.strategy === 'ORB_VWAP') {
-    if (orb) {
-      confidence = orb.confidenceScore;
+  // Sub-strategy evaluator helper so individual strategies & SMART_ENSEMBLE share the exact same engines
+  const evalSubStrategy = (
+    strat: Exclude<XauBotStrategy, 'SMART_ENSEMBLE'>,
+  ): {action: 'BUY' | 'SELL' | 'HOLD'; confidence: number; reason: string} => {
+    if (strat === 'ORB_VWAP') {
+      if (!orb) return {action: 'HOLD', confidence: 40, reason: 'Warming up ORB window...'};
+      const conf = orb.confidenceScore;
       if (
         (orb.signal === 'LONG_BREAKOUT' || orb.signal === 'LONG_RETEST') &&
         instrument.price >= vwap &&
-        confidence >= config.minConfidence
+        conf >= Math.min(config.minConfidence, 55)
       ) {
-        action = 'BUY';
-        reason = `${orb.signal.replace('_', ' ')} above OR High (${formatPrice(
-          orb.orHigh,
-          2,
-        )}) & VWAP (${formatPrice(vwap, 2)})`;
-      } else if (
+        return {
+          action: 'BUY',
+          confidence: conf,
+          reason: `${orb.signal.replace('_', ' ')} above OR High (${formatPrice(orb.orHigh, 2)}) & VWAP (${formatPrice(vwap, 2)})`,
+        };
+      }
+      if (
         (orb.signal === 'SHORT_BREAKOUT' || orb.signal === 'SHORT_RETEST') &&
         instrument.price <= vwap &&
-        confidence >= config.minConfidence
+        conf >= Math.min(config.minConfidence, 55)
       ) {
-        action = 'SELL';
-        reason = `${orb.signal.replace('_', ' ')} below OR Low (${formatPrice(
-          orb.orLow,
-          2,
-        )}) & VWAP (${formatPrice(vwap, 2)})`;
-      } else {
-        reason = `Waiting: ${orb.signal.replace('_', ' ')} (Conf ${confidence}% / Min ${
-          config.minConfidence
-        }%). Long > ${formatPrice(orb.orHigh, 2)}, Short < ${formatPrice(orb.orLow, 2)}.`;
+        return {
+          action: 'SELL',
+          confidence: conf,
+          reason: `${orb.signal.replace('_', ' ')} below OR Low (${formatPrice(orb.orLow, 2)}) & VWAP (${formatPrice(vwap, 2)})`,
+        };
       }
+      return {
+        action: 'HOLD',
+        confidence: Math.min(54, conf),
+        reason: `ORB ${orb.signal.replace('_', ' ')} (${conf}%)`,
+      };
     }
-  } else if (config.strategy === 'EMA_MOMENTUM') {
-    const bullishCross = prevEma9 <= prevEma21 && ema9 > ema21;
-    const bearishCross = prevEma9 >= prevEma21 && ema9 < ema21;
-    const bullishTrend = ema9 > ema21 && instrument.price > vwap && rsi14 >= 52 && rsi14 <= 72;
-    const bearishTrend = ema9 < ema21 && instrument.price < vwap && rsi14 <= 48 && rsi14 >= 28;
 
-    if (bullishCross || bullishTrend) {
-      action = 'BUY';
-      confidence = bullishCross ? 84 : 68;
-      reason = `EMA9 (${formatPrice(ema9, 2)}) > EMA21 (${formatPrice(
-        ema21,
-        2,
-      )}), above VWAP (${formatPrice(vwap, 2)}), RSI ${rsi14.toFixed(1)}`;
-    } else if (bearishCross || bearishTrend) {
-      action = 'SELL';
-      confidence = bearishCross ? 84 : 68;
-      reason = `EMA9 (${formatPrice(ema9, 2)}) < EMA21 (${formatPrice(
-        ema21,
-        2,
-      )}), below VWAP (${formatPrice(vwap, 2)}), RSI ${rsi14.toFixed(1)}`;
-    } else {
-      confidence = 42;
-      reason = `Neutral momentum: EMA9 ${formatPrice(ema9, 2)} vs EMA21 ${formatPrice(
-        ema21,
-        2,
-      )} · RSI ${rsi14.toFixed(1)}`;
+    if (strat === 'EMA_MOMENTUM') {
+      const bullishCross = prevEma9 <= prevEma21 && ema9 > ema21;
+      const bearishCross = prevEma9 >= prevEma21 && ema9 < ema21;
+      const bullishTrend = ema9 > ema21 && instrument.price > vwap && rsi14 >= 52 && rsi14 <= 72;
+      const bearishTrend = ema9 < ema21 && instrument.price < vwap && rsi14 <= 48 && rsi14 >= 28;
+      if (bullishCross || bullishTrend) {
+        return {
+          action: 'BUY',
+          confidence: bullishCross ? 84 : 68,
+          reason: `EMA9 (${formatPrice(ema9, 2)}) > EMA21 (${formatPrice(ema21, 2)}), above VWAP, RSI ${rsi14.toFixed(1)}`,
+        };
+      }
+      if (bearishCross || bearishTrend) {
+        return {
+          action: 'SELL',
+          confidence: bearishCross ? 84 : 68,
+          reason: `EMA9 (${formatPrice(ema9, 2)}) < EMA21 (${formatPrice(ema21, 2)}), below VWAP, RSI ${rsi14.toFixed(1)}`,
+        };
+      }
+      return {
+        action: 'HOLD',
+        confidence: 42,
+        reason: `Neutral momentum: EMA9 ${formatPrice(ema9, 2)} vs EMA21 ${formatPrice(ema21, 2)} · RSI ${rsi14.toFixed(1)}`,
+      };
     }
-  } else if (config.strategy === 'BOLLINGER_REVERSION') {
-    if (instrument.price <= bbLower && rsi14 <= 36) {
-      action = 'BUY';
-      confidence = 78;
-      reason = `Lower Bollinger touch (${formatPrice(
-        bbLower,
-        2,
-      )}) with oversold RSI ${rsi14.toFixed(1)}`;
-    } else if (instrument.price >= bbUpper && rsi14 >= 64) {
-      action = 'SELL';
-      confidence = 78;
-      reason = `Upper Bollinger touch (${formatPrice(
-        bbUpper,
-        2,
-      )}) with overbought RSI ${rsi14.toFixed(1)}`;
-    } else {
-      confidence = 45;
-      reason = `Inside Bollinger Band (${formatPrice(bbLower, 2)}–${formatPrice(
-        bbUpper,
-        2,
-      )}), RSI ${rsi14.toFixed(1)}`;
-    }
-  } else if (config.strategy === 'ORDERFLOW_LIQUIDITY' && flow) {
-    const nearSupport =
-      instrument.price >= flow.valPrice - flow.atr14 * 0.4 &&
-      instrument.price <= flow.pocPrice + flow.atr14 * 0.6;
-    const nearResistance =
-      instrument.price <= flow.vahPrice + flow.atr14 * 0.4 &&
-      instrument.price >= flow.pocPrice - flow.atr14 * 0.6;
 
-    if (
-      flow.buyPressurePct >= 56 &&
-      flow.bookImbalancePct >= 50 &&
-      (flow.verdict === 'STRONG_BUY' || nearSupport || instrument.price > flow.pocPrice)
-    ) {
-      action = 'BUY';
-      confidence = flow.verdict === 'STRONG_BUY' ? 84 : 70;
-      reason = `Order Flow Buy ${flow.buyPressurePct}% · Book Bids ${flow.bookImbalancePct}% · POC ${formatPrice(
-        flow.pocPrice,
-        2,
-      )}`;
-    } else if (
-      flow.sellPressurePct >= 56 &&
-      flow.bookImbalancePct <= 50 &&
-      (flow.verdict === 'STRONG_SELL' || nearResistance || instrument.price < flow.pocPrice)
-    ) {
-      action = 'SELL';
-      confidence = flow.verdict === 'STRONG_SELL' ? 84 : 70;
-      reason = `Order Flow Sell ${flow.sellPressurePct}% · Book Asks ${
-        100 - flow.bookImbalancePct
-      }% · POC ${formatPrice(flow.pocPrice, 2)}`;
-    } else {
-      confidence = Math.max(40, Math.min(62, flow.verdictScore));
-      reason = `Balanced flow (${flow.buyPressurePct}% Buy / ${flow.bookImbalancePct}% Bid) around POC ${formatPrice(
-        flow.pocPrice,
-        2,
-      )}`;
+    if (strat === 'BOLLINGER_REVERSION') {
+      if (instrument.price <= bbLower && rsi14 <= 36) {
+        return {
+          action: 'BUY',
+          confidence: 78,
+          reason: `Lower Bollinger touch (${formatPrice(bbLower, 2)}) with oversold RSI ${rsi14.toFixed(1)}`,
+        };
+      }
+      if (instrument.price >= bbUpper && rsi14 >= 64) {
+        return {
+          action: 'SELL',
+          confidence: 78,
+          reason: `Upper Bollinger touch (${formatPrice(bbUpper, 2)}) with overbought RSI ${rsi14.toFixed(1)}`,
+        };
+      }
+      return {
+        action: 'HOLD',
+        confidence: 45,
+        reason: `Inside Bollinger (${formatPrice(bbLower, 2)}–${formatPrice(bbUpper, 2)}), RSI ${rsi14.toFixed(1)}`,
+      };
     }
+
+    if (strat === 'ORDERFLOW_LIQUIDITY' && flow) {
+      const nearSupport =
+        instrument.price >= flow.valPrice - flow.atr14 * 0.4 &&
+        instrument.price <= flow.pocPrice + flow.atr14 * 0.6;
+      const nearResistance =
+        instrument.price <= flow.vahPrice + flow.atr14 * 0.4 &&
+        instrument.price >= flow.pocPrice - flow.atr14 * 0.6;
+
+      if (
+        flow.buyPressurePct >= 56 &&
+        flow.bookImbalancePct >= 50 &&
+        (flow.verdict === 'STRONG_BUY' || nearSupport || instrument.price > flow.pocPrice)
+      ) {
+        return {
+          action: 'BUY',
+          confidence: flow.verdict === 'STRONG_BUY' ? 84 : 70,
+          reason: `Order Flow Buy ${flow.buyPressurePct}% · Book Bids ${flow.bookImbalancePct}% · POC ${formatPrice(flow.pocPrice, 2)}`,
+        };
+      }
+      if (
+        flow.sellPressurePct >= 56 &&
+        flow.bookImbalancePct <= 50 &&
+        (flow.verdict === 'STRONG_SELL' || nearResistance || instrument.price < flow.pocPrice)
+      ) {
+        return {
+          action: 'SELL',
+          confidence: flow.verdict === 'STRONG_SELL' ? 84 : 70,
+          reason: `Order Flow Sell ${flow.sellPressurePct}% · Book Asks ${100 - flow.bookImbalancePct}% · POC ${formatPrice(flow.pocPrice, 2)}`,
+        };
+      }
+      return {
+        action: 'HOLD',
+        confidence: Math.max(40, Math.min(62, flow.verdictScore)),
+        reason: `Balanced flow (${flow.buyPressurePct}% Buy / ${flow.bookImbalancePct}% Bid) around POC ${formatPrice(flow.pocPrice, 2)}`,
+      };
+    }
+
+    // LIQUIDITY_SWEEP_SMC: Detects stop-run sweeps beyond 20-bar BSL/SSL + rejection wick + ATAS absorption/CVD divergence
+    const sweepLookback = candles.slice(-26, -2);
+    if (sweepLookback.length >= 10) {
+      let swingHigh = -Infinity;
+      let swingLow = Infinity;
+      for (const c of sweepLookback) {
+        if (c.high > swingHigh) swingHigh = c.high;
+        if (c.low < swingLow) swingLow = c.low;
+      }
+      const recent2 = candles.slice(-2);
+      const sweptLow = Math.min(...recent2.map((c) => c.low));
+      const sweptHigh = Math.max(...recent2.map((c) => c.high));
+      const latest = candles[idx];
+      const body = Math.abs(latest.close - latest.open);
+      const lowerWick = Math.min(latest.open, latest.close) - latest.low;
+      const upperWick = latest.high - Math.max(latest.open, latest.close);
+
+      const bullSweep =
+        sweptLow < swingLow - atrEst * 0.08 &&
+        latest.close > swingLow &&
+        (latest.close > latest.open || lowerWick > body * 1.1);
+      const bearSweep =
+        sweptHigh > swingHigh + atrEst * 0.08 &&
+        latest.close < swingHigh &&
+        (latest.close < latest.open || upperWick > body * 1.1);
+
+      if (bullSweep) {
+        let conf = 74;
+        if (flow?.absorptionSignal === 'BULLISH_ABSORPTION' || flow?.cvdDivergence === 'BULLISH') conf += 10;
+        if (rsi14 <= 46) conf += 4;
+        return {
+          action: 'BUY',
+          confidence: Math.min(92, conf),
+          reason: `SMC SSL Sweep below ${formatPrice(swingLow, 2)} & reclaim (${formatPrice(latest.close, 2)})`,
+        };
+      }
+      if (bearSweep) {
+        let conf = 74;
+        if (flow?.absorptionSignal === 'BEARISH_ABSORPTION' || flow?.cvdDivergence === 'BEARISH') conf += 10;
+        if (rsi14 >= 54) conf += 4;
+        return {
+          action: 'SELL',
+          confidence: Math.min(92, conf),
+          reason: `SMC BSL Sweep above ${formatPrice(swingHigh, 2)} & reject (${formatPrice(latest.close, 2)})`,
+        };
+      }
+      return {
+        action: 'HOLD',
+        confidence: 42,
+        reason: `SMC Range ${formatPrice(swingLow, 2)}–${formatPrice(swingHigh, 2)} (no sweep)`,
+      };
+    }
+
+    return {action: 'HOLD', confidence: 40, reason: 'Monitoring live XAU/USD ticks...'};
+  };
+
+  let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
+  let confidence = 40;
+  let reason = 'Monitoring live XAU/USD ticks...';
+  let selectedSubStrategy: XauBotStrategy = config.strategy;
+
+  if (config.strategy === 'SMART_ENSEMBLE') {
+    const subList: Array<Exclude<XauBotStrategy, 'SMART_ENSEMBLE'>> = [
+      'ORB_VWAP',
+      'LIQUIDITY_SWEEP_SMC',
+      'ORDERFLOW_LIQUIDITY',
+      'EMA_MOMENTUM',
+      'BOLLINGER_REVERSION',
+    ];
+    const regimeBonus = (s: Exclude<XauBotStrategy, 'SMART_ENSEMBLE'>): number => {
+      if (regime === 'TRENDING') return s === 'EMA_MOMENTUM' || s === 'ORB_VWAP' ? 8 : s === 'BOLLINGER_REVERSION' ? -8 : 0;
+      if (regime === 'BREAKOUT') return s === 'ORB_VWAP' || s === 'ORDERFLOW_LIQUIDITY' ? 8 : s === 'BOLLINGER_REVERSION' ? -6 : 0;
+      if (regime === 'RANGING') return s === 'BOLLINGER_REVERSION' || s === 'ORDERFLOW_LIQUIDITY' ? 8 : s === 'EMA_MOMENTUM' ? -6 : 0;
+      return s === 'LIQUIDITY_SWEEP_SMC' || s === 'BOLLINGER_REVERSION' ? 9 : -3; // VOLATILE_REVERSAL
+    };
+
+    const evaluated = subList.map((s) => {
+      const res = evalSubStrategy(s);
+      const weightedConf = res.action === 'HOLD' ? res.confidence : Math.max(20, Math.min(96, res.confidence + regimeBonus(s)));
+      return {strategy: s, ...res, weightedConf};
+    });
+
+    const activeSignals = evaluated.filter((e) => e.action !== 'HOLD');
+    const buyVotes = activeSignals.filter((e) => e.action === 'BUY');
+    const sellVotes = activeSignals.filter((e) => e.action === 'SELL');
+
+    if (activeSignals.length === 0) {
+      const bestHold = [...evaluated].sort((a, b) => b.confidence - a.confidence)[0];
+      action = 'HOLD';
+      confidence = bestHold.confidence;
+      reason = `[${regime}] Ensemble scanning (${bestHold.reason})`;
+    } else if (buyVotes.length > 0 && sellVotes.length > 0 && buyVotes.length === sellVotes.length) {
+      action = 'HOLD';
+      confidence = 46;
+      reason = `[${regime}] Conflicting strategies (${buyVotes.length} BUY vs ${sellVotes.length} SELL) — skipped`;
+    } else {
+      const dominantSide = buyVotes.length >= sellVotes.length ? 'BUY' : 'SELL';
+      const winners = (dominantSide === 'BUY' ? buyVotes : sellVotes).sort(
+        (a, b) => b.weightedConf - a.weightedConf,
+      );
+      const top = winners[0];
+      selectedSubStrategy = top.strategy;
+      action = top.action;
+      const consensusBoost = winners.length >= 2 ? Math.min(10, (winners.length - 1) * 5) : 0;
+      const conflictPenalty = (dominantSide === 'BUY' ? sellVotes.length : buyVotes.length) * 6;
+      confidence = Math.max(25, Math.min(96, top.weightedConf + consensusBoost - conflictPenalty));
+      reason = `[${regime} · ${winners.length}/${subList.length} agree] ${top.reason}`;
+    }
+  } else {
+    const single = evalSubStrategy(config.strategy);
+    action = single.action;
+    confidence = single.confidence;
+    reason = single.reason;
   }
 
   const useOrderFlow = config.useOrderFlowConfluence ?? true;
@@ -656,8 +947,26 @@ export function evaluateXauBotSignal(
     }
   }
 
+  // 4b. Killzone Only Guard (optional focus on London Open & NY Open high-edge hours)
+  if ((config.useKillzonesOnly ?? false) && action !== 'HOLD') {
+    const kz = isInsideLondonOrNyKillzone(nowMs);
+    if (!kz.inKillzone) {
+      reason = `Killzone Guard paused ${action}: waiting for London (07–11 UTC) or NY (12:30–17:30 UTC)`;
+      action = 'HOLD';
+      confidence = Math.min(confidence, 42);
+    }
+  }
+
+  // 4c. Anti-Tilt Loss-Streak Cooldown Guard
+  if (antiTilt.active && action !== 'HOLD') {
+    reason = `Anti-Tilt Guard paused ${action} (${antiTilt.trailingLosses} losses in row, ${Math.ceil(
+      antiTilt.cooldownRemainingSec / 60,
+    )}m cooldown left)`;
+    action = 'HOLD';
+    confidence = Math.min(confidence, 38);
+  }
+
   // 5. Economic Calendar News Guard (pauses entries around High-Impact USD events)
-  const nowMs = context?.nowMs ?? Date.now();
   const useNewsGuard = config.useNewsGuard ?? true;
   const pauseBefore = Math.max(5, config.newsPauseMinutesBefore ?? 15);
   const pauseAfter = Math.max(5, config.newsPauseMinutesAfter ?? 15);
@@ -713,12 +1022,20 @@ export function evaluateXauBotSignal(
     action = 'HOLD';
   }
 
-  // ATR-aware SL floor when Order Flow filter is enabled (keeps stops outside gold noise)
+  // ATR-aware SL & proportional TP scaling (protects against gold noise spikes)
+  const useAtrRisk = config.useAtrRiskScaling ?? true;
   const effectiveSl =
-    flow && useOrderFlow && flow.atr14 > 0
-      ? Math.min(20, Math.max(config.stopLossDollars, round2(flow.atr14 * 1.1)))
+    useAtrRisk && flow && flow.atr14 > 0
+      ? Math.min(22, Math.max(config.stopLossDollars, round2(flow.atr14 * 1.25)))
       : config.stopLossDollars;
-  const effectiveTp = Math.max(config.takeProfitDollars, round2(effectiveSl * 1.8));
+  const effectiveTp = Math.max(config.takeProfitDollars, round2(effectiveSl * 1.9));
+  const effectiveLotSize = computeEffectiveBotLot(
+    config,
+    effectiveSl,
+    context?.accountEquity ?? 100_000,
+    context?.closedTrades ?? [],
+    nowMs,
+  );
 
   const sideForBracket: OrderSide = action === 'SELL' ? 'SELL' : 'BUY';
   const entryRef = sideForBracket === 'BUY' ? instrument.ask : instrument.bid;
@@ -733,6 +1050,12 @@ export function evaluateXauBotSignal(
     action,
     confidence,
     reason,
+    selectedSubStrategy,
+    regime,
+    effectiveSlDollars: effectiveSl,
+    effectiveTpDollars: effectiveTp,
+    effectiveLotSize,
+    antiTilt,
     stopLoss,
     takeProfit,
     indicators: {
@@ -823,10 +1146,12 @@ export interface XauBotAnalyticsSummary {
 }
 
 export const STRATEGY_LABELS: Record<XauBotStrategy, string> = {
+  SMART_ENSEMBLE: 'Smart Regime Ensemble',
   ORB_VWAP: 'ORB Breakout + VWAP',
+  LIQUIDITY_SWEEP_SMC: 'Liquidity Sweep + FVG',
+  ORDERFLOW_LIQUIDITY: 'Order Flow + POC/Liquidity',
   EMA_MOMENTUM: 'EMA 9/21 + VWAP + RSI',
   BOLLINGER_REVERSION: 'Bollinger + RSI Reversion',
-  ORDERFLOW_LIQUIDITY: 'Order Flow + POC/Liquidity',
 };
 
 export function computeXauBotStats(
@@ -899,10 +1224,12 @@ export function computeXauBotStats(
   const avgLoss = losses > 0 ? grossLoss / losses : 0;
 
   const strategies: XauBotStrategy[] = [
+    'SMART_ENSEMBLE',
     'ORB_VWAP',
+    'LIQUIDITY_SWEEP_SMC',
+    'ORDERFLOW_LIQUIDITY',
     'EMA_MOMENTUM',
     'BOLLINGER_REVERSION',
-    'ORDERFLOW_LIQUIDITY',
   ];
 
   const strategyBreakdown: StrategyStatRow[] = strategies.map((strat) => {
@@ -986,10 +1313,12 @@ export function adaptBotFromTradeHistory(
 
   // 1. Strategy rotation based on realized expectancy / exploration
   const strategies: XauBotStrategy[] = [
+    'SMART_ENSEMBLE',
     'ORB_VWAP',
+    'LIQUIDITY_SWEEP_SMC',
+    'ORDERFLOW_LIQUIDITY',
     'EMA_MOMENTUM',
     'BOLLINGER_REVERSION',
-    'ORDERFLOW_LIQUIDITY',
   ];
   const byStrat = strategies.map((s) => {
     const rows = chronological.filter((t) => t.strategy === s);
@@ -1116,4 +1445,153 @@ export function adaptBotFromTradeHistory(
   };
 
   return {nextConfig: next, event};
+}
+
+export function runWalkForwardBacktest(
+  instrument: Instrument,
+  candles: Candle[],
+  baseConfig: XauBotConfig,
+  timeframeLabel: string = '15m',
+): BacktestReport {
+  const strategies: XauBotStrategy[] = [
+    'SMART_ENSEMBLE',
+    'ORB_VWAP',
+    'LIQUIDITY_SWEEP_SMC',
+    'ORDERFLOW_LIQUIDITY',
+    'EMA_MOMENTUM',
+    'BOLLINGER_REVERSION',
+  ];
+  const spread = Math.max(0.45, round2(instrument.ask - instrument.bid));
+  const halfSpread = spread / 2;
+  const lot = Math.max(0.01, baseConfig.lotSize || 0.1);
+  const commissionRoundTrip = round2(lot * (instrument.commissionPerUnit || 0.04) * 2);
+
+  const results: BacktestStrategyResult[] = strategies.map((strategy) => {
+    const simCfg: XauBotConfig = {
+      ...baseConfig,
+      strategy,
+      useSessionSpreadGuard: false,
+      useNewsGuard: false,
+      useKillzonesOnly: false,
+    };
+
+    let openPos: {
+      side: OrderSide;
+      entry: number;
+      sl: number;
+      tp: number;
+      beMoved: boolean;
+    } | null = null;
+
+    let wins = 0;
+    let losses = 0;
+    let grossWin = 0;
+    let grossLoss = 0;
+    let netPnl = 0;
+    let peak = 0;
+    let maxDrawdown = 0;
+    const equityCurve: number[] = [0];
+
+    const startIdx = Math.min(Math.max(25, Math.floor(candles.length * 0.2)), candles.length - 5);
+    for (let i = startIdx; i < candles.length; i++) {
+      const bar = candles[i];
+      const historySlice = candles.slice(0, i + 1);
+
+      // 1. Check SL/TP hit on current bar (worst-case conservative order: SL checked first)
+      if (openPos) {
+        let exitPrice: number | null = null;
+        const tpDist = Math.abs(openPos.tp - openPos.entry);
+        if (openPos.side === 'BUY') {
+          if (bar.low <= openPos.sl) exitPrice = openPos.sl;
+          else if (bar.high >= openPos.tp) exitPrice = openPos.tp;
+          else if ((simCfg.autoBreakEvenEnabled ?? true) && !openPos.beMoved && bar.high >= openPos.entry + tpDist * 0.5) {
+            openPos.sl = Math.max(openPos.sl, openPos.entry + 0.35);
+            openPos.beMoved = true;
+          }
+        } else {
+          if (bar.high >= openPos.sl) exitPrice = openPos.sl;
+          else if (bar.low <= openPos.tp) exitPrice = openPos.tp;
+          else if ((simCfg.autoBreakEvenEnabled ?? true) && !openPos.beMoved && bar.low <= openPos.entry - tpDist * 0.5) {
+            openPos.sl = Math.min(openPos.sl, openPos.entry - 0.35);
+            openPos.beMoved = true;
+          }
+        }
+
+        if (exitPrice !== null) {
+          const diff = openPos.side === 'BUY' ? exitPrice - openPos.entry : openPos.entry - exitPrice;
+          const tradeNet = round2(diff * lot * instrument.contractSize - commissionRoundTrip);
+          netPnl = round2(netPnl + tradeNet);
+          if (tradeNet >= 0) {
+            wins += 1;
+            grossWin += tradeNet;
+          } else {
+            losses += 1;
+            grossLoss += Math.abs(tradeNet);
+          }
+          if (netPnl > peak) peak = netPnl;
+          const dd = round2(peak - netPnl);
+          if (dd > maxDrawdown) maxDrawdown = dd;
+          equityCurve.push(netPnl);
+          openPos = null;
+        }
+      }
+
+      // 2. Evaluate new signal at bar close if flat
+      if (!openPos && i < candles.length - 1) {
+        const simInst: Instrument = {
+          ...instrument,
+          price: bar.close,
+          bid: round2(bar.close - halfSpread),
+          ask: round2(bar.close + halfSpread),
+        };
+        const evalRes = evaluateXauBotSignal(simInst, historySlice, simCfg, 15, [], [], {
+          nowMs: bar.time * 1000,
+        });
+        if (evalRes && (evalRes.action === 'BUY' || evalRes.action === 'SELL')) {
+          const fill = evalRes.action === 'BUY' ? simInst.ask : simInst.bid;
+          openPos = {
+            side: evalRes.action,
+            entry: fill,
+            sl: evalRes.stopLoss,
+            tp: evalRes.takeProfit,
+            beMoved: false,
+          };
+        }
+      }
+    }
+
+    const total = wins + losses;
+    const winRate = total > 0 ? (wins / total) * 100 : 0;
+    const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 3.5 : 0;
+    const expectancy = total > 0 ? round2(netPnl / total) : 0;
+
+    return {
+      strategy,
+      label: STRATEGY_LABELS[strategy],
+      trades: total,
+      wins,
+      losses,
+      winRate: Number(winRate.toFixed(1)),
+      netPnl: round2(netPnl),
+      profitFactor: Number(profitFactor.toFixed(2)),
+      maxDrawdown: round2(maxDrawdown),
+      expectancy,
+      equityCurve,
+    };
+  });
+
+  const sorted = [...results].sort((a, b) => {
+    if (a.trades === 0 && b.trades > 0) return 1;
+    if (b.trades === 0 && a.trades > 0) return -1;
+    return b.netPnl - a.netPnl;
+  });
+
+  return {
+    symbol: instrument.symbol,
+    barsTested: candles.length,
+    timeframeLabel,
+    results,
+    recommendedStrategy: sorted[0]?.strategy ?? 'SMART_ENSEMBLE',
+    generatedAt: Date.now(),
+  };
 }
