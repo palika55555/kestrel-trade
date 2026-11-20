@@ -20,6 +20,8 @@ import {SERVER_DATA_DIR} from '../config.ts';
 import {roundToDecimals} from '../marketUtils.ts';
 import {CTraderTokenStore} from './ctrader/oauth.ts';
 import {CTraderService, readCTraderConfig} from './ctrader/service.ts';
+import {type LiveRiskDecision, type LiveRiskInput, evaluateLiveRisk, readLiveRiskLimits} from './liveRiskGuard.ts';
+import {type FetchLike, Mt5BridgeClient, readMt5Config} from './mt5/client.ts';
 
 const CTRADER_TOKEN_FILE = path.join(SERVER_DATA_DIR, 'ctrader-tokens.json');
 
@@ -38,6 +40,7 @@ export class BrokerBridge {
     equity: number | null;
     unrealizedPnl: number | null;
     marginUsed: number | null;
+    dayPnl: number | null;
     openPositionsCount: number;
     currency: string;
     accountLabel: string;
@@ -49,6 +52,7 @@ export class BrokerBridge {
     equity: null,
     unrealizedPnl: null,
     marginUsed: null,
+    dayPnl: null,
     openPositionsCount: 0,
     currency: 'USD',
     accountLabel: 'Paper Simulation Ledger',
@@ -60,8 +64,11 @@ export class BrokerBridge {
   // undefined = not read yet; null = no cTrader credentials in the environment.
   private ctrader: CTraderService | null | undefined;
 
-  constructor(host: BrokerBridgeHost) {
+  private readonly fetchImpl: FetchLike;
+
+  constructor(host: BrokerBridgeHost, fetchImpl: FetchLike = fetch) {
     this.host = host;
+    this.fetchImpl = fetchImpl;
   }
 
   getCTraderService(): CTraderService | null {
@@ -72,65 +79,109 @@ export class BrokerBridge {
     return this.ctrader;
   }
 
-  private detectBrokerEnv() {
+  private detectOanda() {
     const oandaToken = (process.env.OANDA_API_TOKEN || '').trim();
     const oandaAccount = (process.env.OANDA_ACCOUNT_ID || '').trim();
+    if (!oandaToken || !oandaAccount) return null;
     const oandaEnv: 'practice' | 'live' =
       (process.env.OANDA_ENV || 'practice').toLowerCase() === 'live' ? 'live' : 'practice';
-    if (oandaToken && oandaAccount) {
-      return {
-        provider: 'OANDA' as const,
-        configured: true as const,
-        environment: oandaEnv,
-        oandaToken,
-        oandaAccount,
-        oandaBaseUrl: oandaEnv === 'live' ? 'https://api-fxtrade.oanda.com' : 'https://api-fxpractice.oanda.com',
-      };
-    }
+    return {
+      provider: 'OANDA' as const,
+      configured: true as const,
+      environment: oandaEnv,
+      oandaToken,
+      oandaAccount,
+      oandaBaseUrl: oandaEnv === 'live' ? 'https://api-fxtrade.oanda.com' : 'https://api-fxpractice.oanda.com',
+    };
+  }
 
+  private detectMetaApi() {
     const metaToken = (process.env.METAAPI_TOKEN || '').trim();
     const metaAccount = (process.env.METAAPI_ACCOUNT_ID || '').trim();
-    const metaSymbol = (process.env.METAAPI_SYMBOL_XAU || 'XAUUSD').trim();
-    if (metaToken && metaAccount) {
-      return {
-        provider: 'METAAPI' as const,
-        configured: true as const,
-        environment: 'live' as const,
-        metaToken,
-        metaAccount,
-        metaSymbol,
-        metaBaseUrl: 'https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai',
-      };
-    }
-
-    const ctrader = this.getCTraderService();
-    if (ctrader) {
-      return {
-        provider: 'CTRADER' as const,
-        // Credentials alone are not enough: the account must be authorized via OAuth (or a pasted token).
-        configured: ctrader.isAuthorized(),
-        environment: ctrader.config.env === 'live' ? ('live' as const) : ('practice' as const),
-        ctrader,
-      };
-    }
-
-    const webhookUrl = (process.env.BROKER_WEBHOOK_URL || '').trim();
-    const webhookSecret = (process.env.BROKER_WEBHOOK_SECRET || '').trim();
-    if (webhookUrl) {
-      return {
-        provider: 'WEBHOOK' as const,
-        configured: true as const,
-        environment: 'live' as const,
-        webhookUrl,
-        webhookSecret,
-      };
-    }
-
+    if (!metaToken || !metaAccount) return null;
     return {
+      provider: 'METAAPI' as const,
+      configured: true as const,
+      environment: 'live' as const,
+      metaToken,
+      metaAccount,
+      metaSymbol: (process.env.METAAPI_SYMBOL_XAU || 'XAUUSD').trim(),
+      metaBaseUrl: 'https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai',
+    };
+  }
+
+  private detectCTrader() {
+    const ctrader = this.getCTraderService();
+    if (!ctrader) return null;
+    return {
+      provider: 'CTRADER' as const,
+      // Credentials alone are not enough: the account must be authorized via OAuth (or a pasted token).
+      configured: ctrader.isAuthorized(),
+      environment: ctrader.config.env === 'live' ? ('live' as const) : ('practice' as const),
+      ctrader,
+    };
+  }
+
+  private detectMt5() {
+    const config = readMt5Config();
+    if (!config) return null;
+    return {
+      provider: 'MT5' as const,
+      configured: true as const,
+      environment: 'live' as const,
+      mt5: new Mt5BridgeClient(config, this.fetchImpl),
+    };
+  }
+
+  private detectWebhook() {
+    const webhookUrl = (process.env.BROKER_WEBHOOK_URL || '').trim();
+    if (!webhookUrl) return null;
+    return {
+      provider: 'WEBHOOK' as const,
+      configured: true as const,
+      environment: 'live' as const,
+      webhookUrl,
+      webhookSecret: (process.env.BROKER_WEBHOOK_SECRET || '').trim(),
+    };
+  }
+
+  // BROKER_PROVIDER picks exactly one broker. When it is unset the first configured one wins,
+  // in the order OANDA, MetaApi, cTrader, MT5 bridge, webhook.
+  private detectBrokerEnv() {
+    const simulation = (selectionError: string | null = null) => ({
       provider: 'SIMULATION' as const,
       configured: false as const,
       environment: 'practice' as const,
+      selectionError,
+    });
+    const detectors = {
+      OANDA: () => this.detectOanda(),
+      METAAPI: () => this.detectMetaApi(),
+      CTRADER: () => this.detectCTrader(),
+      MT5: () => this.detectMt5(),
+      WEBHOOK: () => this.detectWebhook(),
     };
+
+    try {
+      const selected = (process.env.BROKER_PROVIDER || '').trim().toUpperCase();
+      if (selected === 'SIMULATION') return simulation();
+      if (selected) {
+        if (!Object.hasOwn(detectors, selected)) {
+          return simulation(
+            `BROKER_PROVIDER="${selected}" is not supported (use ${Object.keys(detectors).join(', ')} or SIMULATION).`,
+          );
+        }
+        const env = detectors[selected as keyof typeof detectors]();
+        return env ?? simulation(`BROKER_PROVIDER=${selected} is selected but its credentials are missing in .env.`);
+      }
+      for (const detect of Object.values(detectors)) {
+        const env = detect();
+        if (env) return env;
+      }
+      return simulation();
+    } catch (err) {
+      return simulation(err instanceof Error ? err.message : 'Invalid broker configuration');
+    }
   }
 
   shouldRouteRealBroker(): boolean {
@@ -150,9 +201,12 @@ export class BrokerBridge {
       accountLabel = env.configured
         ? `cTrader ${env.ctrader.config.env.toUpperCase()} (${env.ctrader.config.symbolName})`
         : 'cTrader: not connected (open /api/ctrader/connect)';
+    } else if (env.provider === 'MT5') {
+      accountLabel = `MT5 Local Bridge (${env.mt5.config.symbol})`;
     } else if (env.provider === 'WEBHOOK') {
       accountLabel = 'Custom Broker Webhook Bridge';
     }
+    const selectionError = env.provider === 'SIMULATION' ? env.selectionError : null;
     return {
       provider: env.provider,
       configured: env.configured,
@@ -164,10 +218,11 @@ export class BrokerBridge {
       equity: this.brokerCache.equity,
       unrealizedPnl: this.brokerCache.unrealizedPnl,
       marginUsed: this.brokerCache.marginUsed,
+      dayPnl: this.brokerCache.dayPnl,
       openPositionsCount: this.brokerCache.openPositionsCount,
       lastSyncedAt: this.brokerCache.lastSyncedAt,
       lastOrderSummary: this.brokerCache.lastOrderSummary,
-      lastError: this.brokerCache.lastError,
+      lastError: this.brokerCache.lastError ?? selectionError,
     };
   }
 
@@ -188,7 +243,40 @@ export class BrokerBridge {
         : 'Real Broker Routing DISARMED (Paper Simulation active).',
     );
     this.host.persist();
+    if (armed) void this.refreshIfRouting();
     return this.getBrokerStatus();
+  }
+
+  private syncInFlight = false;
+
+  /** Keeps the cached broker account fresh while live routing is armed. Never overlaps itself. */
+  async refreshIfRouting(): Promise<void> {
+    if (this.syncInFlight || !this.shouldRouteRealBroker()) return;
+    this.syncInFlight = true;
+    try {
+      await this.syncBrokerAccount();
+    } finally {
+      this.syncInFlight = false;
+    }
+  }
+
+  /** Checks one planned order against the LIVE_* risk limits using the latest broker account data. */
+  evaluateLiveOrder(order: Pick<LiveRiskInput, 'lot' | 'stopLossDistance' | 'contractSize' | 'openRisk' | 'openPositions'>): LiveRiskDecision {
+    try {
+      return evaluateLiveRisk(readLiveRiskLimits(), {
+        ...order,
+        equity: this.brokerCache.equity,
+        dayPnl: this.brokerCache.dayPnl,
+      });
+    } catch (err) {
+      return {allowed: false, reason: err instanceof Error ? err.message : 'Invalid live risk limits'};
+    }
+  }
+
+  /** Equity of the real broker account for position sizing; null when not routing live. */
+  getRoutedEquity(): number | null {
+    if (!this.shouldRouteRealBroker()) return null;
+    return this.brokerCache.equity;
   }
 
   async syncBrokerAccount(): Promise<BrokerStatus> {
@@ -281,6 +369,21 @@ export class BrokerBridge {
           openPositionsCount: summary.openPositions,
           lastSyncedAt: Date.now(),
           lastError: null,
+        };
+      } else if (env.provider === 'MT5') {
+        const acc = await env.mt5.getAccount();
+        this.brokerCache = {
+          ...this.brokerCache,
+          accountLabel: `${acc.company || 'MT5'} #${acc.login} (${acc.server})`,
+          currency: acc.currency,
+          balance: roundToDecimals(acc.balance, 2),
+          equity: roundToDecimals(acc.equity, 2),
+          unrealizedPnl: roundToDecimals(acc.profit, 2),
+          marginUsed: roundToDecimals(acc.margin, 2),
+          dayPnl: acc.dayPnl,
+          openPositionsCount: acc.openPositions,
+          lastSyncedAt: Date.now(),
+          lastError: acc.tradeAllowed ? null : 'MT5 terminal: Algo Trading is disabled, orders will be rejected.',
         };
       } else if (env.provider === 'WEBHOOK') {
         this.brokerCache.lastSyncedAt = Date.now();
@@ -388,6 +491,18 @@ export class BrokerBridge {
         return {ok: true, provider: 'CTRADER', brokerTradeId: fill.positionId, fillPrice};
       }
 
+      if (env.provider === 'MT5') {
+        const fill = await env.mt5.openMarket({
+          side: params.side,
+          lots: params.lotSize,
+          stopLoss: params.stopLoss,
+          takeProfit: params.takeProfit,
+        });
+        this.brokerCache.lastOrderSummary = `MT5 ${params.side} ${fill.volume} ${env.mt5.config.symbol} @ ${fill.price.toFixed(2)} (#${fill.ticket})`;
+        this.brokerCache.lastError = null;
+        return {ok: true, provider: 'MT5', brokerTradeId: fill.ticket, fillPrice: fill.price};
+      }
+
       if (env.provider === 'WEBHOOK') {
         const res = await fetch(env.webhookUrl, {
           method: 'POST',
@@ -464,6 +579,8 @@ export class BrokerBridge {
         );
       } else if (env.provider === 'CTRADER') {
         await env.ctrader.client.closePosition(pos.brokerOrderId, fraction);
+      } else if (env.provider === 'MT5') {
+        await env.mt5.closePosition(pos.brokerOrderId, fraction);
       } else if (env.provider === 'WEBHOOK') {
         await fetch(env.webhookUrl, {
           method: 'POST',
@@ -527,6 +644,8 @@ export class BrokerBridge {
         );
       } else if (env.provider === 'CTRADER') {
         await env.ctrader.client.amendPositionRisk(pos.brokerOrderId, stopLoss, takeProfit);
+      } else if (env.provider === 'MT5') {
+        await env.mt5.modifyPosition(pos.brokerOrderId, stopLoss, takeProfit);
       }
     } catch (err) {
       this.brokerCache.lastError = err instanceof Error ? err.message : 'Broker risk update failed';

@@ -9,6 +9,8 @@ interface AccountStripProps {
   freeMargin: number;
   usedMargin: number;
   marginLevelPct: number;
+  /** Set while the figures come from the live broker account instead of the paper ledger. */
+  sourceLabel?: string | null;
   isOnline: boolean;
   streamConnected: boolean;
   setSimulatedOffline: Dispatch<SetStateAction<boolean>>;
@@ -23,6 +25,7 @@ export function AccountStrip({
   freeMargin,
   usedMargin,
   marginLevelPct,
+  sourceLabel = null,
   isOnline,
   streamConnected,
   setSimulatedOffline,
@@ -37,6 +40,14 @@ export function AccountStrip({
             <span className="text-slate-500 dark:text-slate-400 font-sans mr-1.5">
               Equity
             </span>
+            {sourceLabel && (
+              <span
+                title="Čísla z live broker účtu, nie z papierovej simulácie"
+                className="mr-1.5 rounded bg-emerald-500/15 px-1.5 py-0.5 font-sans text-[10px] font-semibold text-emerald-600 dark:text-emerald-400"
+              >
+                LIVE · {sourceLabel}
+              </span>
+            )}
             <span className="font-semibold text-slate-900 dark:text-white">
               {formatCurrency(equity)}
             </span>

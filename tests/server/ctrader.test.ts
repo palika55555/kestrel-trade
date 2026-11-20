@@ -236,6 +236,15 @@ describe('CTraderClient', () => {
     client.close();
   });
 
+  it('accepts the broker login number as CTRADER_ACCOUNT_ID', async () => {
+    const server = makeServer();
+    const client = makeClient(server, 9001);
+    await client.ensureReady();
+    const auth = server.sent().find((m) => m.payloadType === PT.ACCOUNT_AUTH_REQ)!;
+    expect(auth.payload.ctidTraderAccountId).toBe(111);
+    client.close();
+  });
+
   it('refuses a live account when running in demo mode', async () => {
     const client = makeClient(makeServer(), 222);
     await expect(client.ensureReady()).rejects.toThrow(/live but CTRADER_ENV=demo/);

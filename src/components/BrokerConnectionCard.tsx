@@ -27,7 +27,7 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
   const [syncing, setSyncing] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [showSetupGuide, setShowSetupGuide] = useState(false);
-  const [selectedGuide, setSelectedGuide] = useState<'OANDA' | 'METAAPI' | 'CTRADER' | 'WEBHOOK'>('OANDA');
+  const [selectedGuide, setSelectedGuide] = useState<'OANDA' | 'METAAPI' | 'CTRADER' | 'MT5' | 'WEBHOOK'>('OANDA');
 
   const configured = Boolean(brokerStatus?.configured);
   const armed = Boolean(brokerStatus?.routingArmed);
@@ -210,7 +210,7 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
               Vyber brokera a doplň kľúče do .env (server-side):
             </span>
             <div className="flex items-center gap-1">
-              {(['OANDA', 'METAAPI', 'CTRADER', 'WEBHOOK'] as const).map((g) => (
+              {(['OANDA', 'METAAPI', 'CTRADER', 'MT5', 'WEBHOOK'] as const).map((g) => (
                 <button
                   key={g}
                   type="button"
@@ -227,6 +227,8 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
                     ? 'MT4 / MT5 (MetaApi)'
                     : g === 'CTRADER'
                     ? 'cTrader Open API'
+                    : g === 'MT5'
+                    ? 'MT5 lokálne (bez MetaApi)'
                     : 'Custom Webhook'}
                 </button>
               ))}
@@ -279,6 +281,25 @@ CTRADER_ENV="demo"`}
               >
                 Pripojiť cTrader účet
               </a>
+            </div>
+          )}
+
+          {selectedGuide === 'MT5' && (
+            <div className="space-y-2 text-slate-600 dark:text-slate-300">
+              <p>
+                Zadarmo, bez MetaApi: <strong>MT5 terminál</strong> (napr. Blue Guardian) beží na tomto PC, prihlásený na účet, so zapnutým <strong>Algo Trading</strong>. Bridge <code>bridge/mt5_bridge.py</code> ho ovláda cez oficiálny balík MetaTrader5:
+              </p>
+              <pre className="p-2.5 rounded bg-slate-900 text-emerald-300 font-mono text-[11px] overflow-x-auto">
+{`# 1x: pip install MetaTrader5
+# spustenie (kľúč si bridge načíta z .env):
+python bridge/mt5_bridge.py
+
+# .env
+BROKER_PROVIDER="MT5"
+MT5_BRIDGE_URL="http://127.0.0.1:8765"
+MT5_BRIDGE_SECRET="rovnaky_tajny_kluc_min_16_znakov"
+MT5_SYMBOL_XAU="XAUUSD"`}
+              </pre>
             </div>
           )}
 

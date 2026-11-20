@@ -8,6 +8,7 @@ import {SecurityView} from './components/SecurityView';
 import {TopBar} from './components/TopBar';
 import {AlertsTab} from './features/alerts/AlertsTab';
 import {AccountStrip} from './features/layout/AccountStrip';
+import {resolveDisplayAccount} from './services/displayAccount';
 import {ToastStack} from './features/layout/ToastStack';
 import {TradeTab} from './features/trade/TradeTab';
 import type {CenterSubTab, MobileTradePanel} from './features/trade/types';
@@ -243,6 +244,11 @@ export default function App() {
     marginLevelPct,
     dailyPnl,
   } = derived;
+  // While live routing is armed the header and portfolio describe the broker account, not the paper ledger.
+  const displayAccount = resolveDisplayAccount(
+    {cashBalance, dayStartEquity, equity, usedMargin, freeMargin, marginLevelPct, unrealizedPnl, dailyPnl},
+    brokerStatus,
+  );
   // The tick handler's early-exit check reads the latest evaluation through this ref.
   liveRefs.latestXauEvalRef.current = derived.xauBotEvaluation;
 
@@ -322,11 +328,12 @@ export default function App() {
 
       {/* Workspace Telemetry & Account Strip (Clean below-header bar) */}
       <AccountStrip
-        equity={equity}
-        dailyPnl={dailyPnl}
-        freeMargin={freeMargin}
-        usedMargin={usedMargin}
-        marginLevelPct={marginLevelPct}
+        equity={displayAccount.equity}
+        dailyPnl={displayAccount.dailyPnl}
+        freeMargin={displayAccount.freeMargin}
+        usedMargin={displayAccount.usedMargin}
+        marginLevelPct={displayAccount.marginLevelPct}
+        sourceLabel={displayAccount.source === 'BROKER' ? displayAccount.sourceLabel : null}
         isOnline={isOnline}
         streamConnected={streamConnected}
         setSimulatedOffline={setSimulatedOffline}
@@ -427,13 +434,13 @@ export default function App() {
 
         {activeTab === 'portfolio' && (
           <PortfolioView
-            cashBalance={cashBalance}
-            dayStartEquity={dayStartEquity}
-            equity={equity}
-            usedMargin={usedMargin}
-            freeMargin={freeMargin}
-            marginLevelPct={marginLevelPct}
-            unrealizedPnl={unrealizedPnl}
+            cashBalance={displayAccount.cashBalance}
+            dayStartEquity={displayAccount.dayStartEquity}
+            equity={displayAccount.equity}
+            usedMargin={displayAccount.usedMargin}
+            freeMargin={displayAccount.freeMargin}
+            marginLevelPct={displayAccount.marginLevelPct}
+            unrealizedPnl={displayAccount.unrealizedPnl}
             positions={allPositions}
             instrumentsMap={instrumentsMap}
             riskSettings={riskSettings}

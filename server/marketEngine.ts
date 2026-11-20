@@ -194,6 +194,7 @@ export class LiveMarketEngine {
 
     setInterval(() => this.pollSwissquoteAndKraken(), 2000);
     setInterval(() => this.pollYahooQuotes(), 4000);
+    setInterval(() => void this.broker.refreshIfRouting(), 10_000);
     setInterval(() => this.fetchEconomicCalendar(), 15 * 60_000);
     setInterval(() => this.fetchCftcCot(), 6 * 3600_000);
   }
@@ -1195,20 +1196,53 @@ export class LiveMarketEngine {
             const effTp = Math.max(activeCfg.takeProfitDollars, roundToDecimals(effSl * 1.9, 2));
 
             // Dynamic Risk-% sizing + Anti-Tilt 50% recovery sizing after >=2 consecutive losses
-            const serverEquity = Math.max(1000, 100_000 + this.serverBot.netPnl);
+            // Live routing sizes from the real account; the paper ledger is a simulated $100k base.
+            const routedEquity = this.broker.shouldRouteRealBroker() ? this.broker.getRoutedEquity() ?? 0 : null;
+            const serverEquity = routedEquity !== null
+              ? Math.max(1, routedEquity)
+              : Math.max(1000, 100_000 + this.serverBot.netPnl);
             const riskPct = activeCfg.riskPerTradePct ?? 0;
             let rawLot = riskPct > 0
               ? (serverEquity * (Math.min(5, riskPct) / 100)) / (effSl * 100)
               : activeCfg.lotSize;
             if (trailingLosses >= 2) rawLot *= trailingLosses >= 3 ? 0.5 : 0.65;
-            const effLot = Math.max(0.01, Math.min(5.0, roundToDecimals(rawLot, 2)));
+            const botLot = Math.max(0.01, Math.min(5.0, roundToDecimals(rawLot, 2)));
+
+            // Live routing: hard risk limits (LIVE_* in .env) can shrink or veto the order.
+            const liveRouting = this.broker.shouldRouteRealBroker();
+            let liveBlocked = false;
+            let effLot = botLot;
+            if (liveRouting) {
+              const openRisk = this.serverBot.positions.reduce((sum, p) => {
+                const adverse = p.side === 'BUY' ? fill - (p.stopLoss ?? fill) : (p.stopLoss ?? fill) - fill;
+                return sum + p.quantity * xau.contractSize * Math.max(0, p.stopLoss ? adverse : effSl);
+              }, 0);
+              const verdict = this.broker.evaluateLiveOrder({
+                lot: botLot,
+                stopLossDistance: effSl,
+                contractSize: xau.contractSize,
+                openRisk,
+                openPositions: this.serverBot.positions.length,
+              });
+              if (verdict.allowed) {
+                effLot = verdict.lot;
+                if (verdict.limited) {
+                  this.logLiveRisk(`Lot ${botLot} reduced to ${effLot} by live risk limits.`);
+                }
+              } else {
+                liveBlocked = true;
+                this.logLiveRisk(`${action} blocked by live risk limits: ${verdict.reason}.`);
+              }
+            }
 
             const sl = roundToDecimals(action === 'BUY' ? fill - effSl : fill + effSl, 2);
             const tp = roundToDecimals(action === 'BUY' ? fill + effTp * tpMult : fill - effTp * tpMult, 2);
             const trail = tierIdx > 0 ? activeCfg.trailingStopDollars ?? Math.max(4.5, roundToDecimals(effSl * 0.75, 2)) : activeCfg.trailingStopDollars;
             const fee = roundToDecimals(effLot * xau.commissionPerUnit, 2);
 
-            if (!this.brokerOrderInFlight && this.broker.shouldRouteRealBroker()) {
+            if (liveBlocked) {
+              // Nothing is sent to the broker; the reason was logged above.
+            } else if (!this.brokerOrderInFlight && liveRouting) {
               this.brokerOrderInFlight = true;
               void this.broker.routeBrokerOpenOrder({
                 side: action,
@@ -1271,7 +1305,7 @@ export class LiveMarketEngine {
                 );
                 this.persistServerBotState();
               });
-            } else if (!this.broker.shouldRouteRealBroker()) {
+            } else if (!liveRouting) {
               const newPos: Position = {
                 id: `sbpos-${now}-${Math.random().toString(36).slice(2, 6)}`,
                 symbol: 'XAU/USD',
@@ -1365,6 +1399,17 @@ export class LiveMarketEngine {
       bootId: SERVER_BOOT_ID,
       storagePersistent: HAS_PERSISTENT_VOLUME,
     };
+  }
+
+  private liveRiskLog = {message: '', at: 0};
+
+  // The bot re-evaluates every few seconds; log a given message at most once per 5 minutes.
+  private logLiveRisk(message: string) {
+    const now = Date.now();
+    if (message === this.liveRiskLog.message && now - this.liveRiskLog.at < 5 * 60_000) return;
+    this.liveRiskLog = {message, at: now};
+    this.appendServerBotLog('RISK', message);
+    this.persistServerBotState();
   }
 
   updateServerBotConfig(next: Partial<XauBotConfig> & {enabled?: boolean}): ServerBotState {

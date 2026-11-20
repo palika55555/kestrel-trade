@@ -295,13 +295,17 @@ export class CTraderClient {
     const wantLive = this.opts.env === 'live';
     const matching = accounts.filter((a) => Boolean(a.isLive) === wantLive);
     if (this.opts.accountId !== null) {
-      const found = accounts.find((a) => Number(a.ctidTraderAccountId) === this.opts.accountId);
-      if (!found) throw new Error(`cTrader account ${this.opts.accountId} is not authorized for this token`);
+      // Accept either the internal ctidTraderAccountId or the login number the broker shows to the user.
+      const wanted = this.opts.accountId;
+      const found = accounts.find(
+        (a) => Number(a.ctidTraderAccountId) === wanted || Number(a.traderLogin) === wanted,
+      );
+      if (!found) throw new Error(`cTrader account ${wanted} is not authorized for this token`);
       if (Boolean(found.isLive) !== wantLive) {
-        throw new Error(`cTrader account ${this.opts.accountId} is ${found.isLive ? 'live' : 'demo'} but CTRADER_ENV=${this.opts.env}`);
+        throw new Error(`cTrader account ${wanted} is ${found.isLive ? 'live' : 'demo'} but CTRADER_ENV=${this.opts.env}`);
       }
       this.traderLogin = typeof found.traderLogin === 'number' ? found.traderLogin : null;
-      return this.opts.accountId;
+      return Number(found.ctidTraderAccountId);
     }
     if (matching.length !== 1) {
       const ids = matching.map((a) => `${a.ctidTraderAccountId} (login ${a.traderLogin})`).join(', ') || 'none';

@@ -585,7 +585,7 @@ export interface EconomicCalendarSnapshot {
   updatedAt: number;
 }
 
-export type BrokerProvider = 'SIMULATION' | 'OANDA' | 'METAAPI' | 'CTRADER' | 'WEBHOOK';
+export type BrokerProvider = 'SIMULATION' | 'OANDA' | 'METAAPI' | 'CTRADER' | 'MT5' | 'WEBHOOK';
 
 export interface BrokerStatus {
   provider: BrokerProvider;
@@ -598,6 +598,8 @@ export interface BrokerStatus {
   equity: number | null;
   unrealizedPnl: number | null;
   marginUsed: number | null;
+  /** Result since local midnight (realized + floating), when the broker reports it. */
+  dayPnl: number | null;
   openPositionsCount: number;
   lastSyncedAt: number | null;
   lastOrderSummary: string | null;
