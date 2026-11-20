@@ -12,21 +12,29 @@ export function useCandles(
   timeframe: Timeframe,
   isOnline: boolean,
   instruments: Instrument[],
+  brokerProvider?: string,
+  brokerLastSyncedAt?: number | null,
 ) {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [candlesBySymbol, setCandlesBySymbol] = useState<Record<string, Candle[]>>({});
 
   const candlesBySymbolRef = useLatestRef(candlesBySymbol);
   const candlesRef = useLatestRef(candles);
+  const selectedDataSource = instruments.find((i) => i.symbol === selectedSymbol)?.dataSource;
+  const isMt5Live =
+    selectedSymbol === 'XAU/USD' &&
+    (brokerProvider === 'MT5' || selectedDataSource === 'MT5 Live Broker');
 
-  // Fetch candles when symbol or timeframe changes (with IndexedDB offline fallback)
+  // Fetch candles when symbol, timeframe, or live broker feed changes (with periodic live refresh)
   useEffect(() => {
     let cancelled = false;
-    const load = async () => {
-      const cached = await loadCachedCandles(selectedSymbol, timeframe);
-      if (cached && cached.length > 0 && !cancelled) {
-        setCandles(cached);
-        setCandlesBySymbol((prev) => ({...prev, [selectedSymbol]: cached}));
+    const pullCandles = async (useOfflineCache: boolean) => {
+      if (useOfflineCache) {
+        const cached = await loadCachedCandles(selectedSymbol, timeframe);
+        if (cached && cached.length > 0 && !cancelled) {
+          setCandles(cached);
+          setCandlesBySymbol((prev) => ({...prev, [selectedSymbol]: cached}));
+        }
       }
       if (!isOnline) return;
       try {
@@ -44,11 +52,24 @@ export function useCandles(
         // Retain cached candles if offline
       }
     };
-    load();
+
+    void pullCandles(true);
+    if (!isOnline) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const refreshMs = isMt5Live ? 5_000 : 12_000;
+    const timer = setInterval(() => {
+      void pullCandles(false);
+    }, refreshMs);
+
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
-  }, [selectedSymbol, timeframe, isOnline]);
+  }, [selectedSymbol, timeframe, isOnline, isMt5Live, selectedDataSource, brokerLastSyncedAt]);
 
   // Background-fetch 5m candles for all instruments to power Multi-Asset ORB Scanner & Notification Automation
   useEffect(() => {

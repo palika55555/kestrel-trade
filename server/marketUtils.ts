@@ -15,6 +15,8 @@ import type {
   XauBotLogEntry,
   XauBotTradeRecord,
   CotPositioning,
+  DomWallVelocity,
+  FuturesOiRegime,
   GoldMarketRegime,
   InstitutionalGoldContext,
   OrderSide,
@@ -367,4 +369,299 @@ export const MAX_QUOTE_AGE_MS = 30_000;
 
 export function isQuoteStale(lastLiveAt: number, now: number, maxAgeMs = MAX_QUOTE_AGE_MS): boolean {
   return lastLiveAt <= 0 || now - lastLiveAt > maxAgeMs;
+}
+
+/**
+ * Anchors the Opening Range to the latest London (07:00 UTC), NY (13:30 UTC), or UTC midnight
+ * session boundary present in `candles` (with at least `windowBars + 2` bars after open),
+ * avoiding sliding-window drift. Falls back cleanly if only a short history is available.
+ */
+export function computeSessionOrbRange(
+  candles: Candle[],
+  windowMinutes = 15,
+): {orHigh: number; orLow: number; orMid: number} {
+  if (!candles || candles.length === 0) return {orHigh: 0, orLow: 0, orMid: 0};
+  if (candles.length < 6) {
+    const orHigh = Math.max(...candles.map((c) => c.high));
+    const orLow = Math.min(...candles.map((c) => c.low));
+    return {orHigh, orLow, orMid: roundToDecimals((orHigh + orLow) / 2, 2)};
+  }
+
+  const barSec = Math.max(60, candles[candles.length - 1].time - candles[candles.length - 2].time);
+  const windowBars = Math.max(2, Math.min(8, Math.round((windowMinutes * 60) / barSec)));
+
+  let anchorIdx = -1;
+  // Scan backward for the most recent major session open (NY 13:30 UTC, London 07:00 UTC, or 00:00 UTC)
+  // that leaves at least `windowBars + 1` bars after it for post-OR breakout confirmation.
+  for (let i = candles.length - windowBars - 2; i >= 1; i--) {
+    const prevD = new Date(candles[i - 1].time * 1000);
+    const curD = new Date(candles[i].time * 1000);
+    const prevMin = prevD.getUTCHours() * 60 + prevD.getUTCMinutes();
+    const curMin = curD.getUTCHours() * 60 + curD.getUTCMinutes();
+    const newDay = curD.getUTCDate() !== prevD.getUTCDate();
+    const crossedLondon = prevMin < 420 && curMin >= 420;
+    const crossedNy = prevMin < 810 && curMin >= 810;
+    if (newDay || crossedLondon || crossedNy) {
+      anchorIdx = i;
+      break;
+    }
+  }
+
+  const startIdx = anchorIdx >= 0 ? anchorIdx : Math.max(0, candles.length - Math.max(24, windowBars + 18));
+  const orSlice = candles.slice(startIdx, startIdx + windowBars);
+  const orHigh = Math.max(...orSlice.map((c) => c.high));
+  const orLow = Math.min(...orSlice.map((c) => c.low));
+  return {
+    orHigh: roundToDecimals(orHigh, 2),
+    orLow: roundToDecimals(orLow, 2),
+    orMid: roundToDecimals((orHigh + orLow) / 2, 2),
+  };
+}
+
+/**
+ * 18-bin Volume Profile + 70% Value Area + ATAS-style Stacked Imbalance parity for Server Worker.
+ */
+export function computeServerVolumeProfile(
+  candles: Candle[],
+  tickSize = 0.05,
+): {
+  poc: number;
+  vah: number;
+  val: number;
+  stackedImbalance: 'BULLISH_STACK' | 'BEARISH_STACK' | 'NONE';
+} {
+  const recent = candles.slice(-60);
+  if (recent.length === 0) {
+    return {poc: 0, vah: 0, val: 0, stackedImbalance: 'NONE'};
+  }
+  const lowRange = Math.min(...recent.map((b) => b.low));
+  const highRange = Math.max(...recent.map((b) => b.high));
+  const span = Math.max(tickSize * 18, highRange - lowRange);
+  const bins = 18;
+  const binSize = span / bins;
+
+  const profile = Array.from({length: bins}, (_, i) => {
+    const pLow = lowRange + i * binSize;
+    const pHigh = pLow + binSize;
+    return {
+      priceLow: pLow,
+      priceHigh: pHigh,
+      priceMid: roundToDecimals((pLow + pHigh) / 2, 2),
+      buyVol: 0,
+      sellVol: 0,
+      totalVol: 0,
+    };
+  });
+
+  for (const bar of recent) {
+    const typical = (bar.high + bar.low + bar.close) / 3;
+    const idx = Math.min(bins - 1, Math.max(0, Math.floor((typical - lowRange) / binSize)));
+    const range = Math.max(tickSize, bar.high - bar.low);
+    const buyShare = Math.max(0.1, Math.min(0.9, (bar.close - bar.low) / range));
+    const vol = Math.max(1, bar.volume || 1);
+    profile[idx].buyVol += vol * buyShare;
+    profile[idx].sellVol += vol * (1 - buyShare);
+    profile[idx].totalVol += vol;
+  }
+
+  let pocIdx = 0;
+  for (let i = 1; i < bins; i++) {
+    if (profile[i].totalVol > profile[pocIdx].totalVol) pocIdx = i;
+  }
+
+  const totalVol = profile.reduce((a, b) => a + b.totalVol, 0);
+  let vaVol = profile[pocIdx].totalVol;
+  let loPtr = pocIdx - 1;
+  let hiPtr = pocIdx + 1;
+  let valIdx = pocIdx;
+  let vahIdx = pocIdx;
+
+  while (vaVol < totalVol * 0.7 && (loPtr >= 0 || hiPtr < bins)) {
+    const loVol = loPtr >= 0 ? profile[loPtr].totalVol : -1;
+    const hiVol = hiPtr < bins ? profile[hiPtr].totalVol : -1;
+    if (hiVol >= loVol && hiPtr < bins) {
+      vaVol += hiVol;
+      vahIdx = hiPtr;
+      hiPtr++;
+    } else if (loPtr >= 0) {
+      vaVol += loVol;
+      valIdx = loPtr;
+      loPtr--;
+    } else {
+      break;
+    }
+  }
+
+  // Stacked footprint imbalance across last 8 bars (10 cluster rows >= 2.2x ratio, 2+ consecutive levels)
+  const fpBars = recent.slice(-8);
+  const fpLow = Math.min(...fpBars.map((b) => b.low));
+  const fpHigh = Math.max(...fpBars.map((b) => b.high));
+  const fpSpan = Math.max(tickSize * 10, fpHigh - fpLow);
+  const fpBins = 10;
+  const fpBinSize = fpSpan / fpBins;
+  const fpRows = Array.from({length: fpBins}, () => ({bid: 0, ask: 0}));
+  for (const bar of fpBars) {
+    const range = Math.max(tickSize, bar.high - bar.low);
+    const buyShare = Math.max(0.12, Math.min(0.88, (bar.close - bar.low) / range));
+    const vol = Math.max(1, bar.volume || 1);
+    const rowIdx = Math.min(fpBins - 1, Math.max(0, Math.floor(((bar.high + bar.low + bar.close) / 3 - fpLow) / fpBinSize)));
+    fpRows[rowIdx].ask += vol * buyShare;
+    fpRows[rowIdx].bid += vol * (1 - buyShare);
+  }
+  let bullRun = 0;
+  let bearRun = 0;
+  let maxBull = 0;
+  let maxBear = 0;
+  for (const r of fpRows) {
+    if (r.ask > r.bid * 2.2 && r.ask >= 5) {
+      bullRun += 1;
+      bearRun = 0;
+      maxBull = Math.max(maxBull, bullRun);
+    } else if (r.bid > r.ask * 2.2 && r.bid >= 5) {
+      bearRun += 1;
+      bullRun = 0;
+      maxBear = Math.max(maxBear, bearRun);
+    } else {
+      bullRun = 0;
+      bearRun = 0;
+    }
+  }
+  const stackedImbalance: 'BULLISH_STACK' | 'BEARISH_STACK' | 'NONE' =
+    maxBull >= 2 && maxBull >= maxBear ? 'BULLISH_STACK' : maxBear >= 2 ? 'BEARISH_STACK' : 'NONE';
+
+  return {
+    poc: profile[pocIdx].priceMid,
+    vah: roundToDecimals(profile[vahIdx].priceHigh, 2),
+    val: roundToDecimals(profile[valIdx].priceLow, 2),
+    stackedImbalance,
+  };
+}
+
+/**
+ * Institutional Smart Money Technique (SMT) Divergence between Gold (XAU) and COMEX Silver (SI=F).
+ * Compares prior swing window vs recent swing window: if one makes a new swing low while the other
+ * prints a higher low -> BULLISH_SMT; opposite at highs -> BEARISH_SMT.
+ */
+export function detectSilverGoldSmt(
+  goldBars: Candle[],
+  silverBars: Candle[],
+): 'BULLISH_SMT' | 'BEARISH_SMT' | 'NONE' {
+  if (!goldBars || !silverBars || goldBars.length < 16 || silverBars.length < 16) return 'NONE';
+  const gSlice = goldBars.slice(-20);
+  const sSlice = silverBars.slice(-20);
+  const gMid = Math.floor(gSlice.length / 2);
+  const sMid = Math.floor(sSlice.length / 2);
+
+  const gPrev = gSlice.slice(0, gMid);
+  const gRec = gSlice.slice(gMid);
+  const sPrev = sSlice.slice(0, sMid);
+  const sRec = sSlice.slice(sMid);
+
+  const gPrevLow = Math.min(...gPrev.map((c) => c.low));
+  const gRecLow = Math.min(...gRec.map((c) => c.low));
+  const sPrevLow = Math.min(...sPrev.map((c) => c.low));
+  const sRecLow = Math.min(...sRec.map((c) => c.low));
+
+  const gPrevHigh = Math.max(...gPrev.map((c) => c.high));
+  const gRecHigh = Math.max(...gRec.map((c) => c.high));
+  const sPrevHigh = Math.max(...sPrev.map((c) => c.high));
+  const sRecHigh = Math.max(...sRec.map((c) => c.high));
+
+  const gLowerLow = gRecLow < gPrevLow * 0.9996;
+  const gHigherLow = gRecLow > gPrevLow * 1.0004;
+  const sLowerLow = sRecLow < sPrevLow * 0.9994;
+  const sHigherLow = sRecLow > sPrevLow * 1.0005;
+
+  const gHigherHigh = gRecHigh > gPrevHigh * 1.0004;
+  const gLowerHigh = gRecHigh < gPrevHigh * 0.9996;
+  const sHigherHigh = sRecHigh > sPrevHigh * 1.0005;
+  const sLowerHigh = sRecHigh < sPrevHigh * 0.9994;
+
+  // Favor recent reversal candle confirmation so stale divergences don't fire forever
+  const gLast = gRec[gRec.length - 1];
+  const sLast = sRec[sRec.length - 1];
+
+  if (((gLowerLow && sHigherLow) || (sLowerLow && gHigherLow)) && gLast.close >= gRecLow && sLast.close >= sRecLow) {
+    return 'BULLISH_SMT';
+  }
+  if (((gHigherHigh && sLowerHigh) || (sHigherHigh && gLowerHigh)) && gLast.close <= gRecHigh && sLast.close <= sRecHigh) {
+    return 'BEARISH_SMT';
+  }
+  return 'NONE';
+}
+
+/**
+ * Classifies CME/Perp Gold Futures conviction using Price Delta + Open Interest Delta.
+ */
+export function classifyFuturesOiRegime(
+  priceDeltaPct: number,
+  oiDeltaPct: number,
+): FuturesOiRegime {
+  if (oiDeltaPct >= 0.2 && priceDeltaPct >= 0.04) return 'NEW_LONGS';
+  if (oiDeltaPct >= 0.2 && priceDeltaPct <= -0.04) return 'NEW_SHORTS';
+  if (oiDeltaPct <= -0.2 && priceDeltaPct >= 0.04) return 'SHORT_COVERING';
+  if (oiDeltaPct <= -0.2 && priceDeltaPct <= -0.04) return 'LONG_LIQUIDATION';
+  return 'NEUTRAL';
+}
+
+/**
+ * Detects L2 Order Book Stacking vs. Spoof Pulling across consecutive snapshots.
+ */
+export function classifyDomWallVelocity(
+  prevTopBid: number,
+  prevTopAsk: number,
+  curTopBid: number,
+  curTopAsk: number,
+): {velocity: DomWallVelocity; bidDelta: number; askDelta: number} {
+  const bidDelta = Number((curTopBid - prevTopBid).toFixed(2));
+  const askDelta = Number((curTopAsk - prevTopAsk).toFixed(2));
+  if (prevTopBid <= 0 || prevTopAsk <= 0) {
+    return {velocity: 'BALANCED', bidDelta: 0, askDelta: 0};
+  }
+  const bidPct = (bidDelta / prevTopBid) * 100;
+  const askPct = (askDelta / prevTopAsk) * 100;
+
+  let velocity: DomWallVelocity = 'BALANCED';
+  // Pulling asks (ask liquidity disappearing) is an aggressive bullish spoof-pull / thin overhead signal
+  if (askPct <= -14 && Math.abs(askDelta) >= 0.6 && Math.abs(askPct) >= Math.abs(bidPct)) {
+    velocity = 'PULLING_ASKS';
+  } else if (bidPct <= -14 && Math.abs(bidDelta) >= 0.6 && Math.abs(bidPct) >= Math.abs(askPct)) {
+    velocity = 'PULLING_BIDS';
+  } else if (bidPct >= 14 && bidDelta >= 0.6 && bidPct >= askPct) {
+    velocity = 'STACKING_BIDS';
+  } else if (askPct >= 14 && askDelta >= 0.6 && askPct >= bidPct) {
+    velocity = 'STACKING_ASKS';
+  }
+
+  return {velocity, bidDelta, askDelta};
+}
+
+/**
+ * Counts 22:00 UTC rollover boundaries crossed between openedAtMs and closedAtMs
+ * (weekdays only) and returns the signed USD swap P&L (negative = cost, positive = credit).
+ */
+export function computeOvernightSwapPnl(
+  side: OrderSide,
+  quantity: number,
+  openedAtMs: number,
+  closedAtMs: number,
+  swapLongPerLot: number,
+  swapShortPerLot: number,
+): number {
+  if (!Number.isFinite(quantity) || quantity <= 0 || closedAtMs <= openedAtMs) return 0;
+  const shiftMs = 2 * 3600_000; // 22:00 UTC -> 00:00 shifted day boundary
+  const dayMs = 86_400_000;
+  const openDay = Math.floor((openedAtMs + shiftMs) / dayMs);
+  const closeDay = Math.floor((closedAtMs + shiftMs) / dayMs);
+  if (closeDay <= openDay) return 0;
+
+  let nights = 0;
+  for (let d = openDay + 1; d <= closeDay; d += 1) {
+    const rolloverUtcDow = new Date(d * dayMs - shiftMs).getUTCDay();
+    if (rolloverUtcDow === 0 || rolloverUtcDow === 6) continue; // Market closed Sat/Sun
+    nights += 1;
+  }
+  if (nights <= 0) return 0;
+  const rate = side === 'BUY' ? swapLongPerLot : swapShortPerLot;
+  return roundToDecimals(nights * quantity * rate, 2);
 }

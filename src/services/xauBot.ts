@@ -898,6 +898,35 @@ export function evaluateXauBotSignal(
     }
   }
 
+  // 3c. Pro-Trader Execution Discipline: VWAP Overextension & PDH/PDL Exhaustion Guard
+  if (action !== 'HOLD') {
+    if (action === 'BUY' && instrument.price - vwap >= atrEst * 2.1) {
+      confidence = Math.max(18, confidence - 8);
+      reason = `${reason} · Extended above VWAP`;
+    } else if (action === 'SELL' && vwap - instrument.price >= atrEst * 2.1) {
+      confidence = Math.max(18, confidence - 8);
+      reason = `${reason} · Extended below VWAP`;
+    }
+
+    if (instrument.high24h > instrument.low24h) {
+      if (
+        action === 'BUY' &&
+        Math.abs(instrument.high24h - instrument.price) <= 1.2 &&
+        flow?.stackedImbalance !== 'BULLISH_STACK'
+      ) {
+        confidence = Math.max(18, confidence - 5);
+        reason = `${reason} · Near PDH Cap`;
+      } else if (
+        action === 'SELL' &&
+        Math.abs(instrument.price - instrument.low24h) <= 1.2 &&
+        flow?.stackedImbalance !== 'BEARISH_STACK'
+      ) {
+        confidence = Math.max(18, confidence - 5);
+        reason = `${reason} · Near PDL Floor`;
+      }
+    }
+  }
+
   if (instCtx && useOrderFlow && action !== 'HOLD') {
     if (action === 'BUY' && instCtx.paxgBuyPct >= 58 && instCtx.paxgBookBidPct >= 52) {
       confidence = Math.min(98, confidence + 6);
@@ -911,6 +940,91 @@ export function evaluateXauBotSignal(
     } else if (action === 'SELL' && instCtx.paxgBuyPct >= 62 && instCtx.paxgBookBidPct >= 56) {
       confidence = Math.max(18, confidence - 9);
       reason = `${reason} · PAXG Buyer pressure`;
+    }
+
+    if (typeof instCtx.l2Top5BidPct === 'number' && typeof instCtx.l2MicroTiltDollars === 'number') {
+      if (action === 'BUY' && instCtx.l2Top5BidPct >= 60 && instCtx.l2MicroTiltDollars > 0) {
+        confidence = Math.min(98, confidence + 4);
+        reason = `${reason} · L2 Micro + (${instCtx.l2Top5BidPct}% Top5)`;
+      } else if (action === 'SELL' && instCtx.l2Top5BidPct <= 40 && instCtx.l2MicroTiltDollars < 0) {
+        confidence = Math.min(98, confidence + 4);
+        reason = `${reason} · L2 Micro + (${100 - instCtx.l2Top5BidPct}% Top5 Ask)`;
+      } else if (
+        (action === 'BUY' && instCtx.l2Top5BidPct <= 36 && (instCtx.l2FullBidPct ?? 50) <= 44) ||
+        (action === 'SELL' && instCtx.l2Top5BidPct >= 64 && (instCtx.l2FullBidPct ?? 50) >= 56)
+      ) {
+        confidence = Math.max(18, confidence - 7);
+        reason = `${reason} · L2 Book Headwind`;
+      }
+    }
+
+    // DOM Pulling vs. Stacking Spoof Detector
+    const vel = instCtx.l2WallVelocity ?? 'BALANCED';
+    if (action === 'BUY') {
+      if (vel === 'PULLING_ASKS') {
+        confidence = Math.min(98, confidence + 4);
+        reason = `${reason} · Ask Spoof Pulled`;
+      } else {
+        if (instCtx.l2NearestAskWall && instCtx.l2NearestAskWall.distanceDollars <= 1.5) {
+          confidence = Math.max(18, confidence - 5);
+          reason = `${reason} · Near Ask Wall ($${instCtx.l2NearestAskWall.price.toFixed(2)})`;
+        }
+        if (vel === 'STACKING_ASKS') {
+          confidence = Math.max(18, confidence - 7);
+          reason = `${reason} · Stacking Asks`;
+        } else if (vel === 'STACKING_BIDS') {
+          confidence = Math.min(98, confidence + 4);
+          reason = `${reason} · Stacking Bids`;
+        } else if (vel === 'PULLING_BIDS') {
+          confidence = Math.max(18, confidence - 5);
+          reason = `${reason} · Pulling Bids`;
+        }
+      }
+    } else if (action === 'SELL') {
+      if (vel === 'PULLING_BIDS') {
+        confidence = Math.min(98, confidence + 4);
+        reason = `${reason} · Bid Support Pulled`;
+      } else {
+        if (instCtx.l2NearestBidWall && instCtx.l2NearestBidWall.distanceDollars <= 1.5) {
+          confidence = Math.max(18, confidence - 5);
+          reason = `${reason} · Near Bid Wall ($${instCtx.l2NearestBidWall.price.toFixed(2)})`;
+        }
+        if (vel === 'STACKING_BIDS') {
+          confidence = Math.max(18, confidence - 7);
+          reason = `${reason} · Stacking Bids`;
+        } else if (vel === 'STACKING_ASKS') {
+          confidence = Math.min(98, confidence + 4);
+          reason = `${reason} · Stacking Asks`;
+        } else if (vel === 'PULLING_ASKS') {
+          confidence = Math.max(18, confidence - 5);
+          reason = `${reason} · Pulling Asks`;
+        }
+      }
+    }
+
+    // Gold Perpetual Futures OI Regime & Funding Extremes
+    if (instCtx.futuresRegime === 'NEW_LONGS' && action === 'BUY') {
+      confidence = Math.min(98, confidence + 5);
+      reason = `${reason} · Perp OI New Longs`;
+    } else if (instCtx.futuresRegime === 'NEW_SHORTS' && action === 'SELL') {
+      confidence = Math.min(98, confidence + 5);
+      reason = `${reason} · Perp OI New Shorts`;
+    } else if (instCtx.futuresRegime === 'SHORT_COVERING' && action === 'BUY') {
+      confidence = Math.max(18, confidence - 7);
+      reason = `${reason} · Short-Cover Risk`;
+    } else if (instCtx.futuresRegime === 'LONG_LIQUIDATION' && action === 'SELL') {
+      confidence = Math.max(18, confidence - 7);
+      reason = `${reason} · Long-Liq Flush Risk`;
+    }
+
+    if (typeof instCtx.futuresFundingRate === 'number') {
+      if (action === 'BUY' && instCtx.futuresFundingRate >= 0.0005) {
+        confidence = Math.max(18, confidence - 4);
+        reason = `${reason} · Crowded Long Funding`;
+      } else if (action === 'SELL' && instCtx.futuresFundingRate <= -0.0005) {
+        confidence = Math.max(18, confidence - 4);
+        reason = `${reason} · Crowded Short Funding`;
+      }
     }
   }
 
@@ -926,6 +1040,44 @@ export function evaluateXauBotSignal(
       (action === 'SELL' && instCtx.compositeBias === 'BULLISH')
     ) {
       confidence = Math.max(18, confidence - 4);
+    }
+
+    // Silver vs. Gold SMT Divergence
+    if (
+      (action === 'BUY' && instCtx.smtDivergence === 'BULLISH_SMT') ||
+      (action === 'SELL' && instCtx.smtDivergence === 'BEARISH_SMT')
+    ) {
+      confidence = Math.min(98, confidence + 6);
+      reason = `${reason} · Silver SMT +`;
+    } else if (
+      (action === 'BUY' && instCtx.smtDivergence === 'BEARISH_SMT') ||
+      (action === 'SELL' && instCtx.smtDivergence === 'BULLISH_SMT')
+    ) {
+      confidence = Math.max(18, confidence - 6);
+      reason = `${reason} · Silver SMT Diverges`;
+    }
+
+    // US Real Yields (TIP) & Gold Miners (GDX) Lead
+    const tipUp = (instCtx.tipChangePct ?? 0) >= 0.12;
+    const tipDn = (instCtx.tipChangePct ?? 0) <= -0.12;
+    const gdxUp = (instCtx.gdxChangePct ?? 0) >= 0.25;
+    const gdxDn = (instCtx.gdxChangePct ?? 0) <= -0.25;
+    if (action === 'BUY') {
+      if (tipUp && gdxUp) {
+        confidence = Math.min(98, confidence + 3);
+        reason = `${reason} · TIP/GDX +`;
+      } else if (tipDn && gdxDn) {
+        confidence = Math.max(18, confidence - 4);
+        reason = `${reason} · TIP/GDX Headwind`;
+      }
+    } else if (action === 'SELL') {
+      if (tipDn && gdxDn) {
+        confidence = Math.min(98, confidence + 3);
+        reason = `${reason} · TIP/GDX -`;
+      } else if (tipUp && gdxUp) {
+        confidence = Math.max(18, confidence - 4);
+        reason = `${reason} · TIP/GDX Headwind`;
+      }
     }
   }
 

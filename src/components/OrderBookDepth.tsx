@@ -39,6 +39,23 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
     totalBid + totalAsk > 0 ? Math.round((totalBid / (totalBid + totalAsk)) * 100) : 50;
   const askPct = 100 - bidPct;
 
+  const avgAskSize = asksReversed.length > 0 ? asksReversed.reduce((s, r) => s + r.size, 0) / asksReversed.length : 0;
+  const avgBidSize = bidsTop.length > 0 ? bidsTop.reduce((s, r) => s + r.size, 0) / bidsTop.length : 0;
+
+  const bestBid = bidsTop[0];
+  const bestAsk = asksReversed[asksReversed.length - 1];
+  const microPrice =
+    bestBid && bestAsk && bestBid.size + bestAsk.size > 0
+      ? (bestBid.price * bestAsk.size + bestAsk.price * bestBid.size) /
+        (bestBid.size + bestAsk.size)
+      : (instrument.bid + instrument.ask) / 2;
+  const midPrice = (instrument.bid + instrument.ask) / 2;
+  const microTilt = microPrice - midPrice;
+  const isRealL2Symbol =
+    instrument.symbol === 'XAU/USD' ||
+    instrument.symbol === 'GC1!' ||
+    instrument.symbol === 'BTC/USD';
+
   const tapeBuys = recentPrints.filter((p) => p.side === 'BUY').length;
   const tapeSells = recentPrints.filter((p) => p.side === 'SELL').length;
   const tapeBuyPct =
@@ -96,7 +113,7 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
         <div className="inline-flex items-center gap-1 p-0.5 rounded-lg bg-slate-100 dark:bg-[#0D1119] border border-slate-200 dark:border-[#1E2636]">
           {(
             [
-              {id: 'DEPTH', label: 'Depth'},
+              {id: 'DEPTH', label: 'Depth L2'},
               {id: 'TAPE', label: `Tape (${recentPrints.length})`},
               {id: 'LIQUIDITY', label: 'Liquidity'},
             ] as const
@@ -105,7 +122,7 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
               key={t.id}
               type="button"
               onClick={() => setView(t.id)}
-              className={`px-2 py-1 text-[11px] font-medium rounded-md transition-colors cursor-pointer ${
+              className={`px-2 py-1 text-[11px] font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                 view === t.id
                   ? 'bg-white dark:bg-[#1B2232] text-slate-900 dark:text-white'
                   : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -115,14 +132,14 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
             </button>
           ))}
         </div>
-        <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+        <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400 whitespace-nowrap">
           {instrument.symbol}
         </span>
       </div>
 
       {view === 'DEPTH' && (
         <>
-          {/* Bid / Ask Book Imbalance Bar */}
+          {/* Bid / Ask Book Imbalance Bar + Microprice */}
           <div className="px-3 py-2 border-b border-slate-100 dark:border-[#1A2130] space-y-1">
             <div className="flex items-center justify-between text-[11px] font-mono tabular-nums">
               <span className="text-emerald-600 dark:text-emerald-400 font-medium">
@@ -132,11 +149,28 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
                 Ask {askPct}% ({totalAsk.toFixed(1)})
               </span>
             </div>
-            <div className="h-1.5 w-full rounded-full bg-rose-500/35 overflow-hidden flex">
+            <div className="h-1.5 w-full rounded-sm bg-rose-500/35 overflow-hidden flex">
               <div
                 className="h-full bg-emerald-500 transition-all"
                 style={{width: `${bidPct}%`}}
               />
+            </div>
+            <div className="flex items-center justify-between text-[10px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
+              <span>{isRealL2Symbol ? 'Real L2 Book' : 'BBO Depth'}</span>
+              <span>
+                Micro{' '}
+                <strong
+                  className={
+                    microTilt > 0
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : microTilt < 0
+                      ? 'text-rose-600 dark:text-rose-400'
+                      : 'text-slate-600 dark:text-slate-300'
+                  }
+                >
+                  {formatPrice(microPrice, instrument.decimals)}
+                </strong>
+              </span>
             </div>
           </div>
 
@@ -150,12 +184,15 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
           <div className="divide-y divide-transparent">
             {asksReversed.map((lvl, idx) => {
               const depthPct = Math.min(100, (lvl.total / maxTotal) * 100);
+              const isWall = avgAskSize > 0 && lvl.size >= avgAskSize * 1.85;
               return (
                 <button
                   key={`ask-${idx}`}
                   type="button"
                   onClick={() => onSelectPrice?.(lvl.price)}
-                  className="relative w-full grid grid-cols-3 px-3 py-1 text-[11px] font-mono tabular-nums hover:bg-rose-500/10 transition-colors cursor-pointer"
+                  className={`relative w-full grid grid-cols-3 px-3 py-1 text-[11px] font-mono tabular-nums hover:bg-rose-500/10 transition-colors cursor-pointer ${
+                    isWall ? 'bg-rose-500/5 font-semibold' : ''
+                  }`}
                 >
                   <span
                     className="absolute inset-y-0 right-0 bg-rose-500/10 pointer-events-none"
@@ -165,6 +202,7 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
                     {formatPrice(lvl.price, instrument.decimals)}
                   </span>
                   <span className="relative text-right text-slate-700 dark:text-slate-300">
+                    {isWall ? 'W ' : ''}
                     {lvl.size}
                   </span>
                   <span className="relative text-right text-slate-500 dark:text-slate-400">
@@ -187,12 +225,15 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
           <div>
             {bidsTop.map((lvl, idx) => {
               const depthPct = Math.min(100, (lvl.total / maxTotal) * 100);
+              const isWall = avgBidSize > 0 && lvl.size >= avgBidSize * 1.85;
               return (
                 <button
                   key={`bid-${idx}`}
                   type="button"
                   onClick={() => onSelectPrice?.(lvl.price)}
-                  className="relative w-full grid grid-cols-3 px-3 py-1 text-[11px] font-mono tabular-nums hover:bg-emerald-500/10 transition-colors cursor-pointer"
+                  className={`relative w-full grid grid-cols-3 px-3 py-1 text-[11px] font-mono tabular-nums hover:bg-emerald-500/10 transition-colors cursor-pointer ${
+                    isWall ? 'bg-emerald-500/5 font-semibold' : ''
+                  }`}
                 >
                   <span
                     className="absolute inset-y-0 right-0 bg-emerald-500/10 pointer-events-none"
@@ -202,6 +243,7 @@ export const OrderBookDepth: React.FC<OrderBookDepthProps> = ({
                     {formatPrice(lvl.price, instrument.decimals)}
                   </span>
                   <span className="relative text-right text-slate-700 dark:text-slate-300">
+                    {isWall ? 'W ' : ''}
                     {lvl.size}
                   </span>
                   <span className="relative text-right text-slate-500 dark:text-slate-400">

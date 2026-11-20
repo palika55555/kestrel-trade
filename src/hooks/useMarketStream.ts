@@ -63,7 +63,7 @@ export function useMarketStream(
         }
       };
       void pullOnce();
-      pollTimer = setInterval(pullOnce, 1800);
+      pollTimer = setInterval(pullOnce, 1000);
     };
 
     const stopHttpFallback = () => {

@@ -1,4 +1,5 @@
 import {z} from 'zod';
+import type {Candle, Timeframe} from '../../../src/types/trading.ts';
 
 // HTTP client for the local MT5 Python bridge (bridge/mt5_bridge.py).
 // The bridge drives a MetaTrader 5 terminal on this PC through the official MetaTrader5 package,
@@ -6,6 +7,7 @@ import {z} from 'zod';
 
 const DEFAULT_BRIDGE_URL = 'http://127.0.0.1:8765';
 const REQUEST_TIMEOUT_MS = 8000;
+const FEED_TIMEOUT_MS = 2200;
 
 export interface Mt5BridgeConfig {
   baseUrl: string;
@@ -29,6 +31,32 @@ const accountSchema = z.object({
   dayPnl: z.number().nullable().optional().default(null),
 });
 export type Mt5Account = z.infer<typeof accountSchema>;
+
+const quoteSchema = z.object({
+  symbol: z.string(),
+  bid: z.number().positive(),
+  ask: z.number().positive(),
+  last: z.number().optional(),
+  time: z.number().optional().default(0),
+  digits: z.number().int().optional(),
+  spread: z.number().optional(),
+});
+export type Mt5Quote = z.infer<typeof quoteSchema>;
+
+const candleBarSchema = z.object({
+  time: z.number(),
+  open: z.number(),
+  high: z.number(),
+  low: z.number(),
+  close: z.number(),
+  volume: z.number(),
+});
+
+const candlesResponseSchema = z.object({
+  symbol: z.string(),
+  timeframe: z.string(),
+  candles: z.array(candleBarSchema),
+});
 
 const openSchema = z.object({
   ticket: z.union([z.number(), z.string()]).transform(String),
@@ -73,6 +101,23 @@ export class Mt5BridgeClient {
     return accountSchema.parse(await this.request('GET', '/account'));
   }
 
+  async getQuote(): Promise<Mt5Quote> {
+    const query = new URLSearchParams({symbol: this.config.symbol});
+    return quoteSchema.parse(await this.request('GET', `/quote?${query.toString()}`, undefined, FEED_TIMEOUT_MS));
+  }
+
+  async getCandles(timeframe: Timeframe, count = 220): Promise<Candle[]> {
+    const query = new URLSearchParams({
+      symbol: this.config.symbol,
+      timeframe,
+      count: String(count),
+    });
+    const parsed = candlesResponseSchema.parse(
+      await this.request('GET', `/candles?${query.toString()}`, undefined, 3500),
+    );
+    return parsed.candles;
+  }
+
   async openMarket(params: {side: 'BUY' | 'SELL'; lots: number; stopLoss: number; takeProfit: number}): Promise<Mt5Fill> {
     return openSchema.parse(
       await this.request('POST', '/orders/open', {
@@ -93,7 +138,12 @@ export class Mt5BridgeClient {
     await this.request('POST', '/positions/modify', {ticket: Number(ticket), stopLoss, takeProfit});
   }
 
-  private async request(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  private async request(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: unknown,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+  ): Promise<unknown> {
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.config.baseUrl}${path}`, {
@@ -103,7 +153,7 @@ export class Mt5BridgeClient {
           ...(body !== undefined ? {'Content-Type': 'application/json'} : {}),
         },
         ...(body !== undefined ? {body: JSON.stringify(body)} : {}),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);

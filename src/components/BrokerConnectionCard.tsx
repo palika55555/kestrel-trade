@@ -88,7 +88,7 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Server-side execution adapter for 24/7 XAU/USD Bot (OANDA v20, MT4/MT5 via MetaApi, or Broker Webhook).
+              Server-side execution adapter for 24/7 XAU/USD Bot (MT5 lokálny bridge s live grafom, OANDA v20, cTrader, MetaApi).
             </p>
           </div>
         </div>
@@ -287,7 +287,7 @@ CTRADER_ENV="demo"`}
           {selectedGuide === 'MT5' && (
             <div className="space-y-2 text-slate-600 dark:text-slate-300">
               <p>
-                Zadarmo, bez MetaApi: <strong>MT5 terminál</strong> (napr. Blue Guardian) beží na tomto PC, prihlásený na účet, so zapnutým <strong>Algo Trading</strong>. Bridge <code>bridge/mt5_bridge.py</code> ho ovláda cez oficiálny balík MetaTrader5:
+                Zadarmo, bez MetaApi: <strong>MT5 terminál</strong> (napr. Blue Guardian) beží na tomto PC, prihlásený na účet, so zapnutým <strong>Algo Trading</strong>. Po pripojení sa <strong>live cena aj sviečky grafu XAU/USD</strong> berú priamo z MT5 terminálu každých ~0.5s:
               </p>
               <pre className="p-2.5 rounded bg-slate-900 text-emerald-300 font-mono text-[11px] overflow-x-auto">
 {`# 1x: pip install MetaTrader5

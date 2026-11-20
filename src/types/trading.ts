@@ -498,6 +498,52 @@ export interface OrderFlowSnapshot {
   };
 }
 
+export interface DomWallInfo {
+  side: 'BID' | 'ASK';
+  price: number;
+  size: number;
+  distanceDollars: number;
+  venueLabel: string;
+}
+
+export type DomWallVelocity =
+  | 'STACKING_BIDS'
+  | 'STACKING_ASKS'
+  | 'PULLING_BIDS'
+  | 'PULLING_ASKS'
+  | 'BALANCED';
+
+export type FuturesOiRegime =
+  | 'NEW_LONGS'
+  | 'NEW_SHORTS'
+  | 'SHORT_COVERING'
+  | 'LONG_LIQUIDATION'
+  | 'NEUTRAL';
+
+export interface DomLevel2Snapshot {
+  symbol: string;
+  sourceLabel: string;
+  isRealL2: boolean;
+  timestamp: number;
+  midPrice: number;
+  microPrice: number;
+  microPriceDelta: number;
+  spread: number;
+  stepSize: number;
+  top5BidRatioPct: number;
+  fullBookBidRatioPct: number;
+  totalBidLiquidity: number;
+  totalAskLiquidity: number;
+  nearestBidWall: DomWallInfo | null;
+  nearestAskWall: DomWallInfo | null;
+  wallVelocity?: DomWallVelocity;
+  bidWallDelta?: number;
+  askWallDelta?: number;
+  asks: Array<OrderBookLevel & {isWall?: boolean; venues?: string}>;
+  bids: Array<OrderBookLevel & {isWall?: boolean; venues?: string}>;
+  tiers?: Array<{profile: string; bid: number; ask: number}>;
+}
+
 export interface CotPositioning {
   marketName: string;
   reportDate: string;
@@ -534,6 +580,29 @@ export interface InstitutionalGoldContext {
     side: OrderSide;
     timestamp: number;
   }>;
+  l2Top5BidPct?: number;
+  l2FullBidPct?: number;
+  l2MicroTiltDollars?: number;
+  l2NearestBidWall?: DomWallInfo | null;
+  l2NearestAskWall?: DomWallInfo | null;
+  l2SourceSummary?: string;
+  l2WallVelocity?: DomWallVelocity;
+  l2BidWallDelta?: number;
+  l2AskWallDelta?: number;
+  futuresOiOz?: number | null;
+  futuresOiDeltaPct?: number;
+  futuresFundingRate?: number | null;
+  futuresTakerBuySellRatio?: number | null;
+  futuresRegime?: FuturesOiRegime;
+  tipPrice?: number | null;
+  tipChangePct?: number;
+  gdxPrice?: number | null;
+  gdxChangePct?: number;
+  silverPrice?: number | null;
+  silverChangePct?: number;
+  usdJpyPrice?: number | null;
+  usdJpyChangePct?: number;
+  smtDivergence?: 'BULLISH_SMT' | 'BEARISH_SMT' | 'NONE';
   compositeBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   compositeScore: number;
   volatilityAlert: boolean;

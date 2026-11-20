@@ -72,6 +72,18 @@ export function createApiRouter(
     res.json(engine.getOrderFlow(decodeURIComponent(req.params.symbol)));
   });
 
+  router.get('/dom/:symbol', (req, res) => {
+    const symbol = decodeURIComponent(req.params.symbol);
+    const stepParam = typeof req.query.step === 'string' ? parseFloat(req.query.step) : undefined;
+    const step = stepParam && Number.isFinite(stepParam) && stepParam > 0 ? stepParam : undefined;
+    const snap = engine.getDomLevel2?.(symbol, step) ?? null;
+    if (!snap) {
+      res.status(404).json({error: 'DOM unavailable for symbol'});
+      return;
+    }
+    res.json(snap);
+  });
+
   router.get('/macro/gold', (_req, res) => {
     res.json(engine.getGoldMacro());
   });

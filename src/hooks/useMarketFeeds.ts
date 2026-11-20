@@ -91,8 +91,10 @@ export function useGoldContextPolling(
   setGoldMacro: Dispatch<SetStateAction<MacroGoldContext | null>>,
   setInstitutionalGold: Dispatch<SetStateAction<InstitutionalGoldContext | null>>,
   setCalendarSnapshot: Dispatch<SetStateAction<EconomicCalendarSnapshot | null>>,
+  brokerProvider?: string,
+  brokerLastSyncedAt?: number | null,
 ) {
-  // Poll Multi-Timeframe XAU/USD Candles (5m, 15m, 1H) and Macro Gold Context (DXY, US10Y, GC1! Basis)
+  // Poll Multi-Timeframe XAU/USD Candles (5m, 15m, 1H, 4H) and Macro Gold Context (DXY, US10Y, GC1! Basis)
   useEffect(() => {
     if (!isOnline) return;
     let cancelled = false;
@@ -168,9 +170,10 @@ export function useGoldContextPolling(
     fetchMacro();
     fetchInstitutional();
     fetchCalendar();
-    const mtfTimer = setInterval(fetchMtf, 30_000);
-    const macroTimer = setInterval(fetchMacro, 8_000);
-    const instTimer = setInterval(fetchInstitutional, 8_000);
+    const mtfIntervalMs = brokerProvider === 'MT5' ? 10_000 : 15_000;
+    const mtfTimer = setInterval(fetchMtf, mtfIntervalMs);
+    const macroTimer = setInterval(fetchMacro, 6_000);
+    const instTimer = setInterval(fetchInstitutional, 6_000);
     const calTimer = setInterval(fetchCalendar, 60_000);
 
     return () => {
@@ -180,5 +183,5 @@ export function useGoldContextPolling(
       clearInterval(instTimer);
       clearInterval(calTimer);
     };
-  }, [isOnline]);
+  }, [isOnline, brokerProvider, brokerLastSyncedAt]);
 }

@@ -86,3 +86,36 @@ export interface ForexFactoryRawEvent {
   forecast?: string;
   previous?: string;
 }
+
+export interface BinanceDepthResponse {
+  lastUpdateId?: number;
+  bids?: Array<[string, string]>;
+  asks?: Array<[string, string]>;
+}
+
+export interface CoinbaseBookResponse {
+  bids?: Array<[string, string, number]>;
+  asks?: Array<[string, string, number]>;
+}
+
+export interface BinanceOpenInterestResponse {
+  symbol?: string;
+  openInterest?: string;
+  time?: number;
+}
+
+export interface BinancePremiumIndexResponse {
+  symbol?: string;
+  markPrice?: string;
+  indexPrice?: string;
+  lastFundingRate?: string;
+  nextFundingTime?: number;
+}
+
+export interface BinanceTakerRatioRow {
+  buySellRatio?: string;
+  buyVol?: string;
+  sellVol?: string;
+  timestamp?: number;
+}
+

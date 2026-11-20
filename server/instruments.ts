@@ -151,7 +151,7 @@ export const SEEDS: InstrumentSeed[] = [
     maintenanceMarginRate: 0.025,
     overnightSwapLong: -11.4,
     overnightSwapShort: 3.2,
-    commissionPerUnit: 0.0,
+    commissionPerUnit: 3.5,
     fallbackPrice: 3868.3,
     spreadTicks: 35,
     swissquotePair: 'XAU/USD',

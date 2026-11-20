@@ -22,10 +22,12 @@ import logging
 import math
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 try:
     import MetaTrader5 as mt5  # type: ignore[import-not-found]
@@ -41,6 +43,14 @@ TRADE_RETCODE_DONE_PARTIAL = 10010
 OK_RETCODES = {TRADE_RETCODE_DONE, TRADE_RETCODE_PLACED, TRADE_RETCODE_DONE_PARTIAL}
 SYMBOL_FILLING_FOK = 1
 SYMBOL_FILLING_IOC = 2
+TIMEFRAME_ATTRS = {
+    "1m": "TIMEFRAME_M1",
+    "5m": "TIMEFRAME_M5",
+    "15m": "TIMEFRAME_M15",
+    "1H": "TIMEFRAME_H1",
+    "4H": "TIMEFRAME_H4",
+    "1D": "TIMEFRAME_D1",
+}
 
 log = logging.getLogger("mt5_bridge")
 
@@ -291,18 +301,107 @@ class Mt5Gateway:
         })
         return {"ticket": int(pos.ticket), "stopLoss": sl, "takeProfit": tp}
 
+    def _broker_utc_offset(self, symbol: str) -> int:
+        tick = self.api.symbol_info_tick(symbol)
+        tick_time = float(getattr(tick, "time", 0) or 0) if tick is not None else 0.0
+        if tick_time <= 0:
+            return 0
+        now_utc = time.time()
+        diff = tick_time - now_utc
+        # Ignore stale weekend ticks (>14h away) so test fixtures & closed sessions stay unshifted.
+        if abs(diff) > 14 * 3600 + 300:
+            return 0
+        return int(round(diff / 1800.0) * 1800)
+
+    def quote(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        self.ensure_connected()
+        symbol = (query.get("symbol", ["XAUUSD"])[0] or "XAUUSD").strip()
+        info = self._symbol(symbol)
+        tick = self.api.symbol_info_tick(symbol)
+        if tick is None or float(tick.bid) <= 0 or float(tick.ask) <= 0:
+            raise BridgeError(503, f"No live tick for '{symbol}' (market closed?)")
+        bid = round(float(tick.bid), info.digits)
+        ask = round(float(tick.ask), info.digits)
+        last_raw = float(getattr(tick, "last", 0.0) or 0.0)
+        last = round(last_raw if last_raw > 0 else (bid + ask) / 2.0, info.digits)
+        return {
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "time": int(getattr(tick, "time", 0) or 0),
+            "digits": int(info.digits),
+            "spread": round(ask - bid, info.digits),
+        }
+
+    def candles(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        self.ensure_connected()
+        symbol = (query.get("symbol", ["XAUUSD"])[0] or "XAUUSD").strip()
+        tf = (query.get("timeframe", ["15m"])[0] or "15m").strip()
+        tf_attr = TIMEFRAME_ATTRS.get(tf)
+        if not tf_attr:
+            raise BridgeError(400, f"Unsupported timeframe '{tf}'")
+        mt5_tf = getattr(self.api, tf_attr, None)
+        if mt5_tf is None:
+            raise BridgeError(500, f"MT5 timeframe constant {tf_attr} unavailable")
+        raw_count = query.get("count", ["220"])[0]
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise BridgeError(400, "'count' must be an integer") from exc
+        count = max(10, min(500, count))
+
+        info = self._symbol(symbol)
+        rates = self.api.copy_rates_from_pos(symbol, mt5_tf, 0, count)
+        if rates is None or len(rates) == 0:
+            raise BridgeError(503, f"No historical rates for '{symbol}' ({tf})")
+
+        offset_sec = self._broker_utc_offset(symbol)
+        out: list[dict[str, Any]] = []
+        for bar in rates:
+            t_raw = int(_rate_val(bar, "time"))
+            o = round(_rate_val(bar, "open"), info.digits)
+            h = round(_rate_val(bar, "high"), info.digits)
+            l = round(_rate_val(bar, "low"), info.digits)
+            c = round(_rate_val(bar, "close"), info.digits)
+            vol = _rate_val(bar, "tick_volume", 0.0)
+            if vol <= 0:
+                vol = _rate_val(bar, "real_volume", 0.0)
+            out.append({
+                "time": max(1, t_raw - offset_sec),
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": max(1, int(round(vol))),
+            })
+        return {"symbol": symbol, "timeframe": tf, "candles": out}
+
+
+def _rate_val(bar: Any, key: str, default: float = 0.0) -> float:
+    if hasattr(bar, key):
+        return float(getattr(bar, key))
+    try:
+        return float(bar[key])
+    except (KeyError, IndexError, TypeError):
+        return default
+
 
 # ---------------------------------------------------------------- HTTP layer
 
 
 def make_handler(gateway: Mt5Gateway, secret: str) -> type[BaseHTTPRequestHandler]:
-    routes_get = {"/account": lambda _body: gateway.account()}
+    routes_get = {
+        "/account": lambda _body, _query: gateway.account(),
+        "/quote": lambda _body, query: gateway.quote(query),
+        "/candles": lambda _body, query: gateway.candles(query),
+    }
     # Reachable without the key so opening the bridge in a browser shows it is alive (no account data).
     public_get = {"/", "/health"}
     routes_post = {
-        "/orders/open": gateway.open_market,
-        "/positions/close": gateway.close_position,
-        "/positions/modify": gateway.modify_position,
+        "/orders/open": lambda body, _query: gateway.open_market(body),
+        "/positions/close": lambda body, _query: gateway.close_position(body),
+        "/positions/modify": lambda body, _query: gateway.modify_position(body),
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -332,16 +431,19 @@ def make_handler(gateway: Mt5Gateway, secret: str) -> type[BaseHTTPRequestHandle
             return body
 
         def _dispatch(self, routes: dict[str, Any]) -> None:
-            if self.command == "GET" and self.path in public_get:
+            parsed = urlsplit(self.path)
+            route_path = parsed.path
+            query = parse_qs(parsed.query)
+            if self.command == "GET" and route_path in public_get:
                 self._reply(200, {"ok": True, "service": "kestrel-mt5-bridge"})
                 return
             try:
                 if not check_auth(self.headers.get("Authorization"), secret):
                     raise BridgeError(401, "Unauthorized")
-                route = routes.get(self.path)
+                route = routes.get(route_path)
                 if route is None:
                     raise BridgeError(404, "Not found")
-                self._reply(200, route(self._read_body()))
+                self._reply(200, route(self._read_body(), query))
             except BridgeError as exc:
                 log.warning("%s %s -> %s %s", self.command, self.path, exc.status, exc)
                 self._reply(exc.status, {"error": str(exc)})

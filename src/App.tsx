@@ -118,6 +118,8 @@ export default function App() {
     timeframe,
     isOnline,
     instruments,
+    brokerStatus?.provider,
+    brokerStatus?.lastSyncedAt,
   );
 
   const {emitNotification, toastQueue, setToastQueue, pushPermission, setPushPermission} =
@@ -191,6 +193,8 @@ export default function App() {
     setGoldMacro,
     setInstitutionalGold,
     setCalendarSnapshot,
+    brokerStatus?.provider,
+    brokerStatus?.lastSyncedAt,
   );
   useServerBotPolling(isOnline, serverBot);
   const wakeLockActive = useWakeLock(xauBotConfig, server247Enabled);

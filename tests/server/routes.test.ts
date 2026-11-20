@@ -37,6 +37,9 @@ function makeFakeEngine() {
     getEconomicCalendar: vi.fn((before: number, after: number) => ({before, after})),
     getMarkets: vi.fn(() => [{symbol: 'XAU/USD', price: 2400}]),
     getOrderFlow: vi.fn((symbol: string) => ({symbol})),
+    getDomLevel2: vi.fn((symbol: string, step?: number) =>
+      symbol === 'XAU/USD' ? {symbol, stepSize: step ?? 0.5, isRealL2: true} : null,
+    ),
     getGoldMacro: vi.fn(() => ({macroScore: 0})),
     fetchLiveCandles: vi.fn(async (symbol: string) => (symbol === 'XAU/USD' ? [{time: 1, close: 2400}] : [])),
     addSubscriber: vi.fn(),
@@ -118,6 +121,15 @@ describe('API routes', () => {
 
     await post('/bot/close-all', {});
     expect(audit.list()[0]).toMatchObject({action: 'BOT_CLOSE_ALL', summary: 'Closed all bot positions (1)'});
+  });
+
+  it('returns DOM Level 2 snapshot for valid symbol and 404 when unavailable', async () => {
+    const okRes = await fetch(`${base}/dom/XAU%2FUSD?step=1`);
+    expect(okRes.status).toBe(200);
+    expect(await okRes.json()).toMatchObject({symbol: 'XAU/USD', stepSize: 1, isRealL2: true});
+
+    const missRes = await fetch(`${base}/dom/UNKNOWN`);
+    expect(missRes.status).toBe(404);
   });
 
   it('records old and new SL/TP when risk is updated', async () => {

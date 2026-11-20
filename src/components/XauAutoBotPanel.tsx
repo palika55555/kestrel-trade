@@ -589,6 +589,42 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
                         {Math.round(evaluation.institutional.cot.managedMoneyNet / 1000)}k
                       </span>
                     )}
+                    {evaluation.institutional.tipPrice != null && (
+                      <span>
+                        TIP {(evaluation.institutional.tipChangePct ?? 0) >= 0 ? '+' : ''}
+                        {evaluation.institutional.tipChangePct ?? 0}%
+                      </span>
+                    )}
+                    {evaluation.institutional.gdxPrice != null && (
+                      <span>
+                        GDX {(evaluation.institutional.gdxChangePct ?? 0) >= 0 ? '+' : ''}
+                        {evaluation.institutional.gdxChangePct ?? 0}%
+                      </span>
+                    )}
+                    {evaluation.institutional.smtDivergence &&
+                      evaluation.institutional.smtDivergence !== 'NONE' && (
+                        <span
+                          className={
+                            evaluation.institutional.smtDivergence === 'BULLISH_SMT'
+                              ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
+                              : 'text-rose-600 dark:text-rose-400 font-semibold'
+                          }
+                        >
+                          {evaluation.institutional.smtDivergence.replace('_', ' ')}
+                        </span>
+                      )}
+                    {evaluation.institutional.futuresRegime &&
+                      evaluation.institutional.futuresRegime !== 'NEUTRAL' && (
+                        <span>
+                          OI {evaluation.institutional.futuresRegime.replace('_', ' ')}
+                        </span>
+                      )}
+                    {evaluation.institutional.l2WallVelocity &&
+                      evaluation.institutional.l2WallVelocity !== 'BALANCED' && (
+                        <span>
+                          DOM {evaluation.institutional.l2WallVelocity.replace('_', ' ')}
+                        </span>
+                      )}
                   </>
                 )}
                 <span>Regime: {evaluation.regime}</span>

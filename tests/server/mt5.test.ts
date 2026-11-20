@@ -117,6 +117,29 @@ describe('Mt5BridgeClient', () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({ticket: 555, fraction: 0.5});
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({ticket: 555, stopLoss: 2395, takeProfit: null});
   });
+
+  it('fetches live quote and OHLCV candles from the MT5 bridge', async () => {
+    const fetchMock = vi.fn<FetchLike>(async (url) => {
+      if (url.includes('/quote')) {
+        return jsonResponse(200, {symbol: 'XAUUSD.x', bid: 3520.1, ask: 3520.45, spread: 0.35, digits: 2});
+      }
+      return jsonResponse(200, {
+        symbol: 'XAUUSD.x',
+        timeframe: '15m',
+        candles: [{time: 1700000000, open: 3518, high: 3522, low: 3517, close: 3520.2, volume: 210}],
+      });
+    });
+    const client = new Mt5BridgeClient(config, fetchMock);
+
+    const q = await client.getQuote();
+    const bars = await client.getCandles('15m', 120);
+
+    expect(q).toMatchObject({symbol: 'XAUUSD.x', bid: 3520.1, ask: 3520.45});
+    expect(bars).toHaveLength(1);
+    expect(bars[0].close).toBe(3520.2);
+    expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:8765/quote?symbol=XAUUSD.x');
+    expect(fetchMock.mock.calls[1][0]).toBe('http://127.0.0.1:8765/candles?symbol=XAUUSD.x&timeframe=15m&count=120');
+  });
 });
 
 describe('BrokerBridge provider selection', () => {
@@ -225,5 +248,30 @@ describe('BrokerBridge MT5 routing', () => {
     const bridge = bridgeWith(async () => jsonResponse(404, {error: 'Position #777 is not open'}));
     await bridge.routeBrokerCloseOrder({brokerOrderId: '777'} as Position, 1);
     expect(bridge.getBrokerStatus().lastError).toMatch(/not open/);
+  });
+
+  it('fetches MT5 quotes & candles when configured, backs off on error, and resets backoff on sync', async () => {
+    let fail = true;
+    const fetchMock = vi.fn<FetchLike>(async (url) => {
+      if (url.includes('/account')) return jsonResponse(200, ACCOUNT);
+      if (fail) throw new TypeError('connect ECONNREFUSED');
+      if (url.includes('/quote')) return jsonResponse(200, {symbol: 'XAUUSD', bid: 3510.2, ask: 3510.5});
+      return jsonResponse(200, {
+        symbol: 'XAUUSD',
+        timeframe: '5m',
+        candles: [{time: 1700000300, open: 3509, high: 3511, low: 3508.5, close: 3510.3, volume: 90}],
+      });
+    });
+    const bridge = bridgeWith(fetchMock);
+    expect(bridge.isMt5Configured()).toBe(true);
+    expect(await bridge.fetchMt5Quote()).toBeNull();
+    fail = false;
+    // Backoff prevents immediate retry until syncBrokerAccount resets it
+    expect(await bridge.fetchMt5Quote()).toBeNull();
+    await bridge.syncBrokerAccount();
+    const q = await bridge.fetchMt5Quote();
+    const c = await bridge.fetchMt5Candles('5m', 200);
+    expect(q?.bid).toBe(3510.2);
+    expect(c?.[0].close).toBe(3510.3);
   });
 });

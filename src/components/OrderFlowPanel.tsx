@@ -732,6 +732,150 @@ export const OrderFlowPanel: React.FC<OrderFlowPanelProps> = ({
               )}
             </div>
           </div>
+
+          {/* Pro Institutional Cross-Asset Lead & Perpetual Futures OI Row */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1 font-mono text-[11px] tabular-nums">
+              <div className="flex items-center justify-between font-sans">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  Gold Perp OI &amp; Funding
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">Binance fapi</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500 dark:text-slate-400">Open Interest</span>
+                <span className="font-semibold text-slate-900 dark:text-white">
+                  {institutional.futuresOiOz != null
+                    ? `${Math.round(institutional.futuresOiOz).toLocaleString()} oz`
+                    : '--'}{' '}
+                  {typeof institutional.futuresOiDeltaPct === 'number' &&
+                    institutional.futuresOiDeltaPct !== 0 && (
+                      <span
+                        className={
+                          institutional.futuresOiDeltaPct > 0 ? 'text-emerald-500' : 'text-rose-500'
+                        }
+                      >
+                        ({institutional.futuresOiDeltaPct >= 0 ? '+' : ''}
+                        {institutional.futuresOiDeltaPct}%)
+                      </span>
+                    )}
+                </span>
+              </div>
+              <div className="flex justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                <span>
+                  Funding:{' '}
+                  {institutional.futuresFundingRate != null
+                    ? `${(institutional.futuresFundingRate * 100).toFixed(4)}%`
+                    : '--'}
+                </span>
+                <span>
+                  Taker:{' '}
+                  {institutional.futuresTakerBuySellRatio != null
+                    ? `${institutional.futuresTakerBuySellRatio.toFixed(2)}x`
+                    : '--'}
+                </span>
+              </div>
+              <div className="text-[10px] text-slate-400 truncate">
+                Regime: {institutional.futuresRegime ? institutional.futuresRegime.replace('_', ' ') : 'NEUTRAL'}
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1 font-mono text-[11px] tabular-nums">
+              <div className="flex items-center justify-between font-sans">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  Real Yields (TIP) &amp; FX
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">TIPS / Carry</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500 dark:text-slate-400">iShares TIPS (TIP)</span>
+                <span
+                  className={
+                    (institutional.tipChangePct ?? 0) >= 0
+                      ? 'font-semibold text-emerald-600 dark:text-emerald-400'
+                      : 'font-semibold text-rose-600 dark:text-rose-400'
+                  }
+                >
+                  {institutional.tipPrice != null ? `$${institutional.tipPrice.toFixed(2)}` : '--'}{' '}
+                  ({(institutional.tipChangePct ?? 0) >= 0 ? '+' : ''}
+                  {institutional.tipChangePct ?? 0}%)
+                </span>
+              </div>
+              <div className="flex justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                <span>USD/JPY</span>
+                <span>
+                  {institutional.usdJpyPrice != null ? institutional.usdJpyPrice.toFixed(2) : '--'} (
+                  {(institutional.usdJpyChangePct ?? 0) >= 0 ? '+' : ''}
+                  {institutional.usdJpyChangePct ?? 0}%)
+                </span>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1 font-mono text-[11px] tabular-nums">
+              <div className="flex items-center justify-between font-sans">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  Gold Miners Lead (GDX)
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">NYSE Arca</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500 dark:text-slate-400">VanEck Miners</span>
+                <span
+                  className={
+                    (institutional.gdxChangePct ?? 0) >= 0
+                      ? 'font-semibold text-emerald-600 dark:text-emerald-400'
+                      : 'font-semibold text-rose-600 dark:text-rose-400'
+                  }
+                >
+                  {institutional.gdxPrice != null ? `$${institutional.gdxPrice.toFixed(2)}` : '--'}{' '}
+                  ({(institutional.gdxChangePct ?? 0) >= 0 ? '+' : ''}
+                  {institutional.gdxChangePct ?? 0}%)
+                </span>
+              </div>
+              <div className="text-[10px] text-slate-400 truncate">
+                Equities front-run physical Gold swings
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1 font-mono text-[11px] tabular-nums">
+              <div className="flex items-center justify-between font-sans">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  Silver &amp; SMT Divergence
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">SI=F vs XAU</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500 dark:text-slate-400">COMEX Silver</span>
+                <span
+                  className={
+                    (institutional.silverChangePct ?? 0) >= 0
+                      ? 'font-semibold text-emerald-600 dark:text-emerald-400'
+                      : 'font-semibold text-rose-600 dark:text-rose-400'
+                  }
+                >
+                  {institutional.silverPrice != null ? `$${institutional.silverPrice.toFixed(3)}` : '--'}{' '}
+                  ({(institutional.silverChangePct ?? 0) >= 0 ? '+' : ''}
+                  {institutional.silverChangePct ?? 0}%)
+                </span>
+              </div>
+              <div className="flex justify-between text-[10px]">
+                <span className="text-slate-500 dark:text-slate-400">SMT Signal</span>
+                <span
+                  className={
+                    institutional.smtDivergence === 'BULLISH_SMT'
+                      ? 'font-semibold text-emerald-600 dark:text-emerald-400'
+                      : institutional.smtDivergence === 'BEARISH_SMT'
+                      ? 'font-semibold text-rose-600 dark:text-rose-400'
+                      : 'text-slate-400'
+                  }
+                >
+                  {institutional.smtDivergence && institutional.smtDivergence !== 'NONE'
+                    ? institutional.smtDivergence.replace('_', ' ')
+                    : 'Aligned (None)'}
+                </span>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

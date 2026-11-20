@@ -17,6 +17,10 @@ import type {
   XauBotLogEntry,
   XauBotTradeRecord,
   CotPositioning,
+  DomLevel2Snapshot,
+  DomWallInfo,
+  DomWallVelocity,
+  FuturesOiRegime,
   GoldMarketRegime,
   InstitutionalGoldContext,
   OrderSide,
@@ -26,9 +30,48 @@ import {BrokerBridge} from './broker/brokerBridge.ts';
 import type {CTraderService} from './broker/ctrader/service.ts';
 import {createServerBotDefaultConfig} from './botDefaults.ts';
 import {HAS_PERSISTENT_VOLUME, SERVER_BOOT_ID, SERVER_BOT_STATE_PATH} from './config.ts';
-import type {ForexFactoryRawEvent, KrakenDepthResponse, KrakenOHLCResponse, KrakenTickerResponse, KrakenTradesResponse, SpreadTier, SwissquoteQuote, YahooChartResponse} from './feedTypes.ts';
+import type {
+  BinanceDepthResponse,
+  BinanceOpenInterestResponse,
+  BinancePremiumIndexResponse,
+  BinanceTakerRatioRow,
+  CoinbaseBookResponse,
+  ForexFactoryRawEvent,
+  KrakenDepthResponse,
+  KrakenOHLCResponse,
+  KrakenTickerResponse,
+  KrakenTradesResponse,
+  SpreadTier,
+  SwissquoteQuote,
+  YahooChartResponse,
+} from './feedTypes.ts';
 import {SEEDS, type InstrumentSeed} from './instruments.ts';
-import {TIMEFRAME_SECONDS, aggregateCandles4H, isQuoteStale, bratislavaDay, buildSyntheticOrderBook, fetchJsonWithTimeout, generateFallbackCandles, roundToDecimals, serverAdaptConfig, serverAtasBarSignals, serverAtr14, serverBollingerLast, serverDetectRegime, serverEmaLast, serverEmaPrev, serverInKillzone, serverRsiLast, serverVwapLast} from './marketUtils.ts';
+import {
+  TIMEFRAME_SECONDS,
+  aggregateCandles4H,
+  isQuoteStale,
+  bratislavaDay,
+  buildSyntheticOrderBook,
+  classifyDomWallVelocity,
+  classifyFuturesOiRegime,
+  computeOvernightSwapPnl,
+  computeServerVolumeProfile,
+  computeSessionOrbRange,
+  detectSilverGoldSmt,
+  fetchJsonWithTimeout,
+  generateFallbackCandles,
+  roundToDecimals,
+  serverAdaptConfig,
+  serverAtasBarSignals,
+  serverAtr14,
+  serverBollingerLast,
+  serverDetectRegime,
+  serverEmaLast,
+  serverEmaPrev,
+  serverInKillzone,
+  serverRsiLast,
+  serverVwapLast,
+} from './marketUtils.ts';
 import os from 'os';
 import path from 'path';
 
@@ -68,9 +111,17 @@ export class LiveMarketEngine {
   private serverBotLastHoldLogAt = 0;
   private brokerOrderInFlight = false;
   private swissquoteInFlight = false;
+  private mt5QuoteInFlight = false;
+  private mt5LastLiveAt = 0;
+  private mt5LastBroadcastAt = 0;
+  private mt5HadLiveFeed = false;
   private yahooInFlight = false;
   private cotPositioning: CotPositioning | null = null;
   private instFlowLastPollAt = 0;
+  private silverBarsLastPollAt = 0;
+  private silver5mCandles: Candle[] = [];
+  private futuresOiHistory: Array<{ts: number; oiOz: number; markPrice: number}> = [];
+  private goldL2History: Array<{ts: number; top5Bid: number; top5Ask: number}> = [];
   private instFlow: {
     gvz: number | null;
     gvzChangePct: number;
@@ -92,6 +143,19 @@ export class LiveMarketEngine {
       side: OrderSide;
       timestamp: number;
     }>;
+    futuresOiOz: number | null;
+    futuresOiDeltaPct: number;
+    futuresPriceDeltaPct: number;
+    futuresFundingRate: number | null;
+    futuresTakerBuySellRatio: number | null;
+    tipPrice: number | null;
+    tipChangePct: number;
+    gdxPrice: number | null;
+    gdxChangePct: number;
+    silverPrice: number | null;
+    silverChangePct: number;
+    usdJpyPrice: number | null;
+    usdJpyChangePct: number;
     updatedAt: number;
   } = {
     gvz: null,
@@ -108,8 +172,42 @@ export class LiveMarketEngine {
     paxgBuyPct: 50,
     paxgBookBidPct: 50,
     paxgLargePrints: [],
+    futuresOiOz: null,
+    futuresOiDeltaPct: 0,
+    futuresPriceDeltaPct: 0,
+    futuresFundingRate: null,
+    futuresTakerBuySellRatio: null,
+    tipPrice: null,
+    tipChangePct: 0,
+    gdxPrice: null,
+    gdxChangePct: 0,
+    silverPrice: null,
+    silverChangePct: 0,
+    usdJpyPrice: null,
+    usdJpyChangePct: 0,
     updatedAt: 0,
   };
+  private goldL2Raw: {
+    bids: Array<{offset: number; size: number; venue: string}>;
+    asks: Array<{offset: number; size: number; venue: string}>;
+    venues: string[];
+    updatedAt: number;
+  } = {
+    bids: [],
+    asks: [],
+    venues: [],
+    updatedAt: 0,
+  };
+  private btcL2Raw: {
+    bids: Array<{price: number; size: number}>;
+    asks: Array<{price: number; size: number}>;
+    updatedAt: number;
+  } = {
+    bids: [],
+    asks: [],
+    updatedAt: 0,
+  };
+  private coinbaseLastPollAt = 0;
 
   private broker = new BrokerBridge({
     isRoutingArmed: () => Boolean(this.serverBot.brokerRoutingArmed),
@@ -128,8 +226,16 @@ export class LiveMarketEngine {
     return this.broker.setBrokerRoutingArmed(armed);
   }
 
-  syncBrokerAccount(): Promise<BrokerStatus> {
-    return this.broker.syncBrokerAccount();
+  async syncBrokerAccount(): Promise<BrokerStatus> {
+    const status = await this.broker.syncBrokerAccount();
+    if (this.broker.isMt5Configured()) {
+      for (const key of Array.from(this.candleFetchedAt.keys())) {
+        if (key.startsWith('XAU/USD:')) this.candleFetchedAt.delete(key);
+      }
+      void this.pollMt5Tick();
+      void this.refreshMt5Candles();
+    }
+    return status;
   }
 
   getCTraderService(): CTraderService | null {
@@ -186,14 +292,16 @@ export class LiveMarketEngine {
     this.loadServerBotState();
 
     // Immediate initial live pull, then scheduled live polling
+    this.pollMt5Tick();
     this.pollSwissquoteAndKraken();
     this.pollYahooQuotes();
     this.preloadInitialCandles();
     this.fetchEconomicCalendar();
     this.fetchCftcCot();
 
-    setInterval(() => this.pollSwissquoteAndKraken(), 2000);
-    setInterval(() => this.pollYahooQuotes(), 4000);
+    setInterval(() => this.pollMt5Tick(), 500);
+    setInterval(() => this.pollSwissquoteAndKraken(), 1000);
+    setInterval(() => this.pollYahooQuotes(), 3000);
     setInterval(() => void this.broker.refreshIfRouting(), 10_000);
     setInterval(() => this.fetchEconomicCalendar(), 15 * 60_000);
     setInterval(() => this.fetchCftcCot(), 6 * 3600_000);
@@ -259,7 +367,15 @@ export class LiveMarketEngine {
       ? this.serverBot.positions.reduce((a, p) => {
           const m = p.side === 'BUY' ? xau.bid : xau.ask;
           const d = p.side === 'BUY' ? m - p.entryPrice : p.entryPrice - m;
-          return a + d * p.quantity * xau.contractSize;
+          const swapPnl = computeOvernightSwapPnl(
+            p.side,
+            p.quantity,
+            p.openedAt,
+            Date.now(),
+            xau.overnightSwapLong,
+            xau.overnightSwapShort,
+          );
+          return a + d * p.quantity * xau.contractSize - (p.commissionPaid || 0) + swapPnl;
         }, 0)
       : 0;
     return {
@@ -445,6 +561,7 @@ export class LiveMarketEngine {
       volume24h?: number;
       bids?: OrderBookLevel[];
       asks?: OrderBookLevel[];
+      dataSource?: string;
       feedStatus: 'LIVE' | 'FALLBACK';
     },
   ) {
@@ -452,6 +569,7 @@ export class LiveMarketEngine {
     const seed = this.seeds.get(symbol);
     if (!inst || !seed || !Number.isFinite(opts.price) || opts.price <= 0) return;
     if (opts.feedStatus === 'LIVE') this.lastLiveQuoteAt.set(symbol, Date.now());
+    if (opts.dataSource) inst.dataSource = opts.dataSource;
 
     const price = roundToDecimals(opts.price, seed.decimals);
     const halfSpread = (seed.spreadTicks * seed.tickSize) / 2;
@@ -501,6 +619,10 @@ export class LiveMarketEngine {
     if (opts.bids && opts.asks) {
       inst.bids = opts.bids;
       inst.asks = opts.asks;
+    } else if ((symbol === 'XAU/USD' || symbol === 'GC1!') && this.goldL2Raw.bids.length > 0 && this.goldL2Raw.asks.length > 0) {
+      const aligned = this.buildGoldCompactBook(bid, ask, seed.decimals);
+      inst.bids = aligned.bids;
+      inst.asks = aligned.asks;
     } else {
       const book = buildSyntheticOrderBook(bid, ask, seed.tickSize, seed.decimals);
       inst.bids = book.bids;
@@ -559,6 +681,66 @@ export class LiveMarketEngine {
     }
   }
 
+  private async refreshMt5Candles() {
+    if (!this.broker.isMt5Configured()) return;
+    await Promise.all([
+      this.fetchLiveCandles('XAU/USD', '5m').catch(() => {}),
+      this.fetchLiveCandles('XAU/USD', '15m').catch(() => {}),
+      this.fetchLiveCandles('XAU/USD', '1H').catch(() => {}),
+    ]);
+  }
+
+  private async pollMt5Tick() {
+    if (this.mt5QuoteInFlight || !this.broker.isMt5Configured()) return;
+    this.mt5QuoteInFlight = true;
+    try {
+      const q = await this.broker.fetchMt5Quote();
+      const xau = this.instruments.get('XAU/USD');
+      const seed = this.seeds.get('XAU/USD');
+      if (!q) {
+        if (this.mt5HadLiveFeed && Date.now() - this.mt5LastLiveAt > 5000 && xau && seed) {
+          this.mt5HadLiveFeed = false;
+          xau.dataSource = seed.dataSourceLabel;
+        }
+        return;
+      }
+
+      const firstConnect = !this.mt5HadLiveFeed;
+      const now = Date.now();
+      this.mt5HadLiveFeed = true;
+      this.mt5LastLiveAt = now;
+
+      const changed = !xau || Math.abs(xau.bid - q.bid) >= 0.005 || Math.abs(xau.ask - q.ask) >= 0.005;
+      const mid = (q.bid + q.ask) / 2;
+      this.applyQuoteUpdate('XAU/USD', {
+        price: mid,
+        bid: q.bid,
+        ask: q.ask,
+        dataSource: 'MT5 Live Broker',
+        feedStatus: 'LIVE',
+      });
+
+      if (firstConnect) {
+        for (const key of Array.from(this.candleFetchedAt.keys())) {
+          if (key.startsWith('XAU/USD:')) this.candleFetchedAt.delete(key);
+        }
+        void this.refreshMt5Candles();
+      }
+
+      if (changed || firstConnect || now - this.mt5LastBroadcastAt >= 1000) {
+        this.mt5LastBroadcastAt = now;
+        try {
+          this.evaluateServerBotTick();
+        } catch (err) {
+          console.error('[bot] evaluateServerBotTick error:', err);
+        }
+        this.broadcastTick();
+      }
+    } finally {
+      this.mt5QuoteInFlight = false;
+    }
+  }
+
   private async pollSwissquoteAndKraken() {
     if (this.swissquoteInFlight) return;
     this.swissquoteInFlight = true;
@@ -566,6 +748,9 @@ export class LiveMarketEngine {
       const swissSeeds = SEEDS.filter((s) => s.swissquotePair);
     await Promise.all([
       ...swissSeeds.map(async (seed) => {
+        if (seed.symbol === 'XAU/USD' && Date.now() - this.mt5LastLiveAt < 5000) {
+          return;
+        }
         const data = await fetchJsonWithTimeout<SwissquoteQuote[]>(
           `https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/${seed.swissquotePair}`,
           3500,
@@ -590,6 +775,7 @@ export class LiveMarketEngine {
             price: mid,
             bid: profile.bid,
             ask: profile.ask,
+            dataSource: seed.dataSourceLabel,
             feedStatus: 'LIVE',
           });
         }
@@ -603,7 +789,7 @@ export class LiveMarketEngine {
             3500,
           ),
           fetchJsonWithTimeout<KrakenDepthResponse>(
-            `https://api.kraken.com/0/public/Depth?pair=${krakenSeed.krakenPair}&count=15`,
+            `https://api.kraken.com/0/public/Depth?pair=${krakenSeed.krakenPair}&count=40`,
             3500,
           ),
           fetchJsonWithTimeout<KrakenTradesResponse>(
@@ -629,6 +815,11 @@ export class LiveMarketEngine {
         const dKey = depthData?.result ? Object.keys(depthData.result)[0] : undefined;
         const d = dKey ? depthData?.result?.[dKey] : undefined;
         if (d) {
+          this.btcL2Raw = {
+            bids: d.bids.map(([p, sz]) => ({price: parseFloat(p), size: parseFloat(sz) || 0})).filter((x) => x.price > 0 && x.size > 0),
+            asks: d.asks.map(([p, sz]) => ({price: parseFloat(p), size: parseFloat(sz) || 0})).filter((x) => x.price > 0 && x.size > 0),
+            updatedAt: Date.now(),
+          };
           let bCum = 0;
           let aCum = 0;
           bids = d.bids.slice(0, 12).map(([p, sz]) => {
@@ -675,17 +866,29 @@ export class LiveMarketEngine {
           feedStatus: 'LIVE',
         });
       })(),
-      // Real executed Gold Order Flow & Depth via Kraken PAXG/USD (1:1 tokenized physical gold)
+      // Real executed Gold Order Flow & Multi-Venue L2 DOM (Kraken PAXG/USD + Binance PAXGUSDT + Coinbase PAXG-USD)
       (async () => {
-        const [paxgTrades, paxgDepth] = await Promise.all([
+        const fetchCoinbase = Date.now() - this.coinbaseLastPollAt >= 4000;
+        if (fetchCoinbase) this.coinbaseLastPollAt = Date.now();
+        const [paxgTrades, paxgDepth, binanceDepth, coinbaseBook] = await Promise.all([
           fetchJsonWithTimeout<KrakenTradesResponse>(
             'https://api.kraken.com/0/public/Trades?pair=PAXGUSD&count=60',
             3500,
           ),
           fetchJsonWithTimeout<KrakenDepthResponse>(
-            'https://api.kraken.com/0/public/Depth?pair=PAXGUSD&count=15',
+            'https://api.kraken.com/0/public/Depth?pair=PAXGUSD&count=25',
             3500,
           ),
+          fetchJsonWithTimeout<BinanceDepthResponse>(
+            'https://api.binance.com/api/v3/depth?symbol=PAXGUSDT&limit=50',
+            3200,
+          ),
+          fetchCoinbase
+            ? fetchJsonWithTimeout<CoinbaseBookResponse>(
+                'https://api.exchange.coinbase.com/products/PAXG-USD/book?level=2',
+                3500,
+              )
+            : Promise.resolve(null),
         ]);
 
         const trKey = paxgTrades?.result
@@ -728,15 +931,104 @@ export class LiveMarketEngine {
           this.instFlow.updatedAt = Date.now();
         }
 
+        const mergedBids: Array<{offset: number; size: number; venue: string}> = [];
+        const mergedAsks: Array<{offset: number; size: number; venue: string}> = [];
+        const activeVenues: string[] = [];
+
         const dKey = paxgDepth?.result ? Object.keys(paxgDepth.result)[0] : undefined;
-        const depth = dKey ? paxgDepth?.result?.[dKey] : undefined;
-        if (depth) {
-          const bidSum = depth.bids.slice(0, 12).reduce((a, r) => a + (parseFloat(r[1]) || 0), 0);
-          const askSum = depth.asks.slice(0, 12).reduce((a, r) => a + (parseFloat(r[1]) || 0), 0);
+        const kDepth = dKey ? paxgDepth?.result?.[dKey] : undefined;
+        if (kDepth?.bids?.length && kDepth?.asks?.length) {
+          const kb0 = parseFloat(kDepth.bids[0][0]);
+          const ka0 = parseFloat(kDepth.asks[0][0]);
+          const kMid = (kb0 + ka0) / 2;
+          if (kMid > 0) {
+            activeVenues.push('Kraken');
+            for (const [p, s] of kDepth.bids) {
+              const offset = parseFloat(p) - kMid;
+              const size = parseFloat(s);
+              if (Math.abs(offset) <= 45 && size > 0) mergedBids.push({offset, size, venue: 'Kraken'});
+            }
+            for (const [p, s] of kDepth.asks) {
+              const offset = parseFloat(p) - kMid;
+              const size = parseFloat(s);
+              if (Math.abs(offset) <= 45 && size > 0) mergedAsks.push({offset, size, venue: 'Kraken'});
+            }
+          }
+          const bidSum = kDepth.bids.slice(0, 12).reduce((a, r) => a + (parseFloat(r[1]) || 0), 0);
+          const askSum = kDepth.asks.slice(0, 12).reduce((a, r) => a + (parseFloat(r[1]) || 0), 0);
           const tot = bidSum + askSum;
           if (tot > 0) {
             this.instFlow.paxgBookBidPct = Math.round((bidSum / tot) * 100);
             this.instFlow.updatedAt = Date.now();
+          }
+        }
+
+        if (binanceDepth?.bids?.length && binanceDepth?.asks?.length) {
+          const bb0 = parseFloat(binanceDepth.bids[0][0]);
+          const ba0 = parseFloat(binanceDepth.asks[0][0]);
+          const bMid = (bb0 + ba0) / 2;
+          if (bMid > 0) {
+            activeVenues.push('Binance');
+            for (const [p, s] of binanceDepth.bids) {
+              const offset = parseFloat(p) - bMid;
+              const size = parseFloat(s);
+              if (Math.abs(offset) <= 45 && size > 0) mergedBids.push({offset, size, venue: 'Binance'});
+            }
+            for (const [p, s] of binanceDepth.asks) {
+              const offset = parseFloat(p) - bMid;
+              const size = parseFloat(s);
+              if (Math.abs(offset) <= 45 && size > 0) mergedAsks.push({offset, size, venue: 'Binance'});
+            }
+          }
+        }
+
+        if (coinbaseBook?.bids?.length && coinbaseBook?.asks?.length) {
+          const cb0 = parseFloat(coinbaseBook.bids[0][0]);
+          const ca0 = parseFloat(coinbaseBook.asks[0][0]);
+          const cMid = (cb0 + ca0) / 2;
+          if (cMid > 0) {
+            activeVenues.push('Coinbase');
+            for (const [p, s] of coinbaseBook.bids.slice(0, 50)) {
+              const offset = parseFloat(p) - cMid;
+              const size = parseFloat(s);
+              if (Math.abs(offset) <= 45 && size > 0) mergedBids.push({offset, size, venue: 'Coinbase'});
+            }
+            for (const [p, s] of coinbaseBook.asks.slice(0, 50)) {
+              const offset = parseFloat(p) - cMid;
+              const size = parseFloat(s);
+              if (Math.abs(offset) <= 45 && size > 0) mergedAsks.push({offset, size, venue: 'Coinbase'});
+            }
+          }
+        } else if (!fetchCoinbase && this.goldL2Raw.venues.includes('Coinbase')) {
+          // Preserve Coinbase deep resting liquidity between 4s polls
+          for (const b of this.goldL2Raw.bids) {
+            if (b.venue === 'Coinbase') mergedBids.push(b);
+          }
+          for (const a of this.goldL2Raw.asks) {
+            if (a.venue === 'Coinbase') mergedAsks.push(a);
+          }
+          activeVenues.push('Coinbase');
+        }
+
+        if (mergedBids.length > 0 && mergedAsks.length > 0) {
+          this.goldL2Raw = {
+            bids: mergedBids,
+            asks: mergedAsks,
+            venues: Array.from(new Set(activeVenues)),
+            updatedAt: Date.now(),
+          };
+          const xauInst = this.instruments.get('XAU/USD');
+          if (xauInst) {
+            const aligned = this.buildGoldCompactBook(xauInst.bid, xauInst.ask, xauInst.decimals);
+            xauInst.bids = aligned.bids;
+            xauInst.asks = aligned.asks;
+            const top5Bid = aligned.bids.slice(0, 5).reduce((s, l) => s + l.size, 0);
+            const top5Ask = aligned.asks.slice(0, 5).reduce((s, l) => s + l.size, 0);
+            const nowTs = Date.now();
+            this.goldL2History = [
+              ...this.goldL2History.filter((h) => nowTs - h.ts <= 30_000),
+              {ts: nowTs, top5Bid: Number(top5Bid.toFixed(2)), top5Ask: Number(top5Ask.toFixed(2))},
+            ].slice(-18);
           }
         }
       })(),
@@ -830,14 +1122,16 @@ export class LiveMarketEngine {
         const fav = cur.side === 'BUY' ? exitMark - cur.entryPrice : cur.entryPrice - exitMark;
 
         if ((cfg.autoBreakEvenEnabled ?? true) && !cur.breakEvenMoved && tpDist > 0 && fav >= tpDist * 0.5) {
-          const be = roundToDecimals(cur.side === 'BUY' ? cur.entryPrice + 0.35 : cur.entryPrice - 0.35, 2);
+          const be = roundToDecimals(cur.side === 'BUY' ? cur.entryPrice + 0.45 : cur.entryPrice - 0.45, 2);
           cur.stopLoss =
             cur.side === 'BUY'
               ? cur.stopLoss !== null ? Math.max(cur.stopLoss, be) : be
               : cur.stopLoss !== null ? Math.min(cur.stopLoss, be) : be;
           cur.breakEvenMoved = true;
           stateDirty = true;
-          void this.broker.routeBrokerModifyRisk(cur, cur.stopLoss, cur.takeProfit);
+          if (Math.abs(exitMark - cur.stopLoss) >= 0.5) {
+            void this.broker.routeBrokerModifyRisk(cur, cur.stopLoss, cur.takeProfit);
+          }
           this.appendServerBotLog('RISK', `Auto BE locked SL @ ${cur.stopLoss.toFixed(2)}`);
         }
 
@@ -847,8 +1141,17 @@ export class LiveMarketEngine {
           if (closeQty > 0 && remQty > 0) {
             const diff = cur.side === 'BUY' ? exitMark - cur.entryPrice : cur.entryPrice - exitMark;
             const gross = roundToDecimals(diff * closeQty * xau.contractSize, 2);
-            const fee = roundToDecimals(closeQty * xau.commissionPerUnit * 2, 2);
-            const net = roundToDecimals(gross - fee, 2);
+            const commissionFee = roundToDecimals(closeQty * xau.commissionPerUnit * 2, 2);
+            const swapPnl = computeOvernightSwapPnl(
+              cur.side,
+              closeQty,
+              cur.openedAt,
+              now,
+              xau.overnightSwapLong,
+              xau.overnightSwapShort,
+            );
+            const fee = roundToDecimals(commissionFee + Math.max(0, -swapPnl), 2);
+            const net = roundToDecimals(gross - commissionFee + swapPnl, 2);
             this.serverBot.closedTrades = this.capClosedTrades([
               {
                 id: `sbtr-${now}-p`,
@@ -911,8 +1214,17 @@ export class LiveMarketEngine {
         void this.broker.routeBrokerCloseOrder(cur, 1);
         const diff = cur.side === 'BUY' ? exitMark - cur.entryPrice : cur.entryPrice - exitMark;
         const gross = roundToDecimals(diff * cur.quantity * xau.contractSize, 2);
-        const fee = roundToDecimals(cur.quantity * xau.commissionPerUnit * 2, 2);
-        const net = roundToDecimals(gross - fee, 2);
+        const commissionFee = roundToDecimals(cur.quantity * xau.commissionPerUnit * 2, 2);
+        const swapPnl = computeOvernightSwapPnl(
+          cur.side,
+          cur.quantity,
+          cur.openedAt,
+          now,
+          xau.overnightSwapLong,
+          xau.overnightSwapShort,
+        );
+        const fee = roundToDecimals(commissionFee + Math.max(0, -swapPnl), 2);
+        const net = roundToDecimals(gross - commissionFee + swapPnl, 2);
         this.serverBot.closedTrades = this.capClosedTrades([
           {
             id: `sbtr-${now}-${Math.random().toString(36).slice(2, 5)}`,
@@ -1050,11 +1362,12 @@ export class LiveMarketEngine {
         const bb = serverBollingerLast(bars, 20);
         const regime = serverDetectRegime(bars, ema9, ema21, bb.upper, bb.lower, rsi, atr14);
         const atas = serverAtasBarSignals(bars);
+        const vp = computeServerVolumeProfile(bars, xau.tickSize);
 
-        // ORB levels from recent opening slice
-        const orSlice = bars.slice(Math.max(0, bars.length - 24), Math.max(4, bars.length - 18));
-        const orHigh = orSlice.length > 0 ? Math.max(...orSlice.map((b) => b.high)) : xau.price + 5;
-        const orLow = orSlice.length > 0 ? Math.min(...orSlice.map((b) => b.low)) : xau.price - 5;
+        // Session-anchored Opening Range (London / NY / UTC midnight)
+        const orbRange = computeSessionOrbRange(bars, 15);
+        const orHigh = orbRange.orHigh > 0 ? orbRange.orHigh : xau.price + 5;
+        const orLow = orbRange.orLow > 0 ? orbRange.orLow : xau.price - 5;
 
         const evalSub = (strat: Exclude<XauBotStrategy, 'SMART_ENSEMBLE'>): {action: 'BUY' | 'SELL' | 'HOLD'; conf: number} => {
           if (strat === 'ORB_VWAP') {
@@ -1079,8 +1392,10 @@ export class LiveMarketEngine {
             return {action: 'HOLD', conf: 44};
           }
           if (strat === 'ORDERFLOW_LIQUIDITY') {
-            if (buyPct >= 56 && xau.price >= vwap) return {action: 'BUY', conf: 72};
-            if (buyPct <= 44 && xau.price <= vwap) return {action: 'SELL', conf: 72};
+            const nearSupport = xau.price >= vp.val - atr14 * 0.4 && xau.price <= vp.poc + atr14 * 0.6;
+            const nearResistance = xau.price <= vp.vah + atr14 * 0.4 && xau.price >= vp.poc - atr14 * 0.6;
+            if (buyPct >= 56 && xau.price >= vwap && (nearSupport || xau.price > vp.poc)) return {action: 'BUY', conf: 74};
+            if (buyPct <= 44 && xau.price <= vwap && (nearResistance || xau.price < vp.poc)) return {action: 'SELL', conf: 74};
             return {action: 'HOLD', conf: 45};
           }
           // LIQUIDITY_SWEEP_SMC
@@ -1148,6 +1463,11 @@ export class LiveMarketEngine {
             else if (action === 'SELL' && buyPct <= 44) conf += 8;
             else if (action === 'SELL' && buyPct >= 60) conf -= 14;
           }
+          if ((action === 'BUY' && vp.stackedImbalance === 'BULLISH_STACK') || (action === 'SELL' && vp.stackedImbalance === 'BEARISH_STACK')) {
+            conf += 4;
+          } else if ((action === 'BUY' && vp.stackedImbalance === 'BEARISH_STACK') || (action === 'SELL' && vp.stackedImbalance === 'BULLISH_STACK')) {
+            conf -= 8;
+          }
           if ((action === 'BUY' && (atas.absorption === 'BULLISH_ABSORPTION' || atas.cvdDivergence === 'BULLISH')) ||
               (action === 'SELL' && (atas.absorption === 'BEARISH_ABSORPTION' || atas.cvdDivergence === 'BEARISH'))) {
             conf += 4;
@@ -1167,17 +1487,98 @@ export class LiveMarketEngine {
           else if ((action === 'BUY' && macro.macroBias === 'BEARISH') || (action === 'SELL' && macro.macroBias === 'BULLISH')) conf -= 8;
         }
 
-        // Institutional Gold Flow & ATAS Aggressor Filter (PAXG real trades + GVZ volatility + COT/GLD)
+        // Pro Trader Discipline: VWAP Overextension & PDH/PDL Exhaustion Guard
+        if (action !== 'HOLD') {
+          if (action === 'BUY' && xau.price - vwap >= atr14 * 2.1) {
+            conf -= 8; // Refuse chasing stretched tops far above VWAP
+          } else if (action === 'SELL' && vwap - xau.price >= atr14 * 2.1) {
+            conf -= 8; // Refuse chasing stretched bottoms far below VWAP
+          }
+          if (xau.high24h > xau.low24h) {
+            if (action === 'BUY' && Math.abs(xau.high24h - xau.price) <= 1.2 && vp.stackedImbalance !== 'BULLISH_STACK') {
+              conf -= 5; // Chasing right into PDH without stacked buyers
+            } else if (action === 'SELL' && Math.abs(xau.price - xau.low24h) <= 1.2 && vp.stackedImbalance !== 'BEARISH_STACK') {
+              conf -= 5; // Chasing right into PDL without stacked sellers
+            }
+          }
+        }
+
+        // Institutional Gold Flow, Multi-Venue L2 Microprice, Spoof Pulling/Stacking, Futures OI, Real Yields & Silver SMT
         const instCtx = this.getInstitutionalGold();
         if (action !== 'HOLD' && (activeCfg.useOrderFlowConfluence ?? true)) {
           if (action === 'BUY' && instCtx.paxgBuyPct >= 58 && instCtx.paxgBookBidPct >= 52) conf += 6;
           else if (action === 'BUY' && instCtx.paxgBuyPct <= 38 && instCtx.paxgBookBidPct <= 44) conf -= 9;
           else if (action === 'SELL' && instCtx.paxgBuyPct <= 42 && instCtx.paxgBookBidPct <= 48) conf += 6;
           else if (action === 'SELL' && instCtx.paxgBuyPct >= 62 && instCtx.paxgBookBidPct >= 56) conf -= 9;
+
+          if (typeof instCtx.l2Top5BidPct === 'number' && typeof instCtx.l2MicroTiltDollars === 'number') {
+            if (action === 'BUY' && instCtx.l2Top5BidPct >= 60 && instCtx.l2MicroTiltDollars > 0) conf += 4;
+            else if (action === 'SELL' && instCtx.l2Top5BidPct <= 40 && instCtx.l2MicroTiltDollars < 0) conf += 4;
+            else if (
+              (action === 'BUY' && instCtx.l2Top5BidPct <= 36 && (instCtx.l2FullBidPct ?? 50) <= 44) ||
+              (action === 'SELL' && instCtx.l2Top5BidPct >= 64 && (instCtx.l2FullBidPct ?? 50) >= 56)
+            ) {
+              conf -= 7;
+            }
+          }
+
+          // DOM Pulling vs. Stacking Spoof Detector
+          const vel = instCtx.l2WallVelocity ?? 'BALANCED';
+          if (action === 'BUY') {
+            if (vel === 'PULLING_ASKS') {
+              conf += 4; // Overhead ask wall pulled -> path cleared / spoof vanished
+            } else {
+              if (instCtx.l2NearestAskWall && instCtx.l2NearestAskWall.distanceDollars <= 1.5) conf -= 5;
+              if (vel === 'STACKING_ASKS') conf -= 7;
+              else if (vel === 'STACKING_BIDS') conf += 4;
+              else if (vel === 'PULLING_BIDS') conf -= 5;
+            }
+          } else if (action === 'SELL') {
+            if (vel === 'PULLING_BIDS') {
+              conf += 4; // Underneath bid support pulled -> vacuum down
+            } else {
+              if (instCtx.l2NearestBidWall && instCtx.l2NearestBidWall.distanceDollars <= 1.5) conf -= 5;
+              if (vel === 'STACKING_BIDS') conf -= 7;
+              else if (vel === 'STACKING_ASKS') conf += 4;
+              else if (vel === 'PULLING_ASKS') conf -= 5;
+            }
+          }
+
+          // Binance PAXGUSDT Perpetual Futures OI Regime & Funding Extremes
+          if (instCtx.futuresRegime === 'NEW_LONGS' && action === 'BUY') conf += 5;
+          else if (instCtx.futuresRegime === 'NEW_SHORTS' && action === 'SELL') conf += 5;
+          else if (instCtx.futuresRegime === 'SHORT_COVERING' && action === 'BUY') conf -= 7;
+          else if (instCtx.futuresRegime === 'LONG_LIQUIDATION' && action === 'SELL') conf -= 7;
+
+          if (typeof instCtx.futuresFundingRate === 'number') {
+            if (action === 'BUY' && instCtx.futuresFundingRate >= 0.0005) conf -= 4;
+            else if (action === 'SELL' && instCtx.futuresFundingRate <= -0.0005) conf -= 4;
+          }
         }
+
         if (action !== 'HOLD' && (activeCfg.useMacroConfluence ?? true)) {
           if ((action === 'BUY' && instCtx.compositeBias === 'BULLISH') || (action === 'SELL' && instCtx.compositeBias === 'BEARISH')) conf += 4;
           else if ((action === 'BUY' && instCtx.compositeBias === 'BEARISH') || (action === 'SELL' && instCtx.compositeBias === 'BULLISH')) conf -= 4;
+
+          // Silver vs Gold SMT Divergence
+          if ((action === 'BUY' && instCtx.smtDivergence === 'BULLISH_SMT') || (action === 'SELL' && instCtx.smtDivergence === 'BEARISH_SMT')) {
+            conf += 6;
+          } else if ((action === 'BUY' && instCtx.smtDivergence === 'BEARISH_SMT') || (action === 'SELL' && instCtx.smtDivergence === 'BULLISH_SMT')) {
+            conf -= 6;
+          }
+
+          // Real Yields (TIP) & Gold Miners (GDX)
+          const tipUp = (instCtx.tipChangePct ?? 0) >= 0.12;
+          const tipDn = (instCtx.tipChangePct ?? 0) <= -0.12;
+          const gdxUp = (instCtx.gdxChangePct ?? 0) >= 0.25;
+          const gdxDn = (instCtx.gdxChangePct ?? 0) <= -0.25;
+          if (action === 'BUY') {
+            if (tipUp && gdxUp) conf += 3;
+            else if (tipDn && gdxDn) conf -= 4;
+          } else if (action === 'SELL') {
+            if (tipDn && gdxDn) conf += 3;
+            else if (tipUp && gdxUp) conf -= 4;
+          }
         }
 
         const effectiveMinConf = instCtx.volatilityAlert ? Math.min(90, activeCfg.minConfidence + 5) : activeCfg.minConfidence;
@@ -1187,7 +1588,7 @@ export class LiveMarketEngine {
           const sameSide = this.serverBot.positions.filter((p) => p.side === action);
           const closestDist = sameSide.length > 0 ? Math.min(...sameSide.map((p) => Math.abs(p.entryPrice - fill))) : 999;
 
-          if (sameSide.length === 0 || closestDist >= 1.5 || conf >= 76) {
+          if (sameSide.length === 0 || closestDist >= 1.8 || (closestDist >= 0.9 && conf >= 80)) {
             const tierIdx = sameSide.length;
             const tpMult = roundToDecimals(1 + tierIdx * 0.35, 2);
             const effSl = (activeCfg.useAtrRiskScaling ?? true) && atr14 > 0
@@ -1261,6 +1662,8 @@ export class LiveMarketEngine {
                   return;
                 }
                 const actualFill = brokerRes.fillPrice || fill;
+                const actualSl = roundToDecimals(action === 'BUY' ? actualFill - effSl : actualFill + effSl, 2);
+                const actualTp = roundToDecimals(action === 'BUY' ? actualFill + effTp * tpMult : actualFill - effTp * tpMult, 2);
                 const newPos: Position = {
                   id: `sbpos-${now}-${Math.random().toString(36).slice(2, 6)}`,
                   symbol: 'XAU/USD',
@@ -1269,8 +1672,8 @@ export class LiveMarketEngine {
                   entryPrice: actualFill,
                   leverage: activeCfg.leverage,
                   marginUsed: roundToDecimals((actualFill * effLot * xau.contractSize) / activeCfg.leverage, 2),
-                  stopLoss: sl,
-                  takeProfit: tp,
+                  stopLoss: actualSl,
+                  takeProfit: actualTp,
                   trailingStopDistance: trail,
                   peakFavorablePrice: actualFill,
                   openedAt: now,
@@ -1281,6 +1684,9 @@ export class LiveMarketEngine {
                   brokerOrderId: brokerRes.brokerTradeId,
                   brokerProvider: brokerRes.provider,
                 };
+                if (Math.abs(actualFill - fill) >= 0.05 && brokerRes.brokerTradeId) {
+                  void this.broker.routeBrokerModifyRisk(newPos, actualSl, actualTp);
+                }
                 this.serverBot.positions = [newPos, ...this.serverBot.positions];
                 this.serverBot.executions = [
                   {
@@ -1445,8 +1851,17 @@ export class LiveMarketEngine {
         const exitMark = pos.side === 'BUY' ? xau.bid : xau.ask;
         const diff = pos.side === 'BUY' ? exitMark - pos.entryPrice : pos.entryPrice - exitMark;
         const gross = roundToDecimals(diff * pos.quantity * xau.contractSize, 2);
-        const fee = roundToDecimals(pos.quantity * xau.commissionPerUnit * 2, 2);
-        const net = roundToDecimals(gross - fee, 2);
+        const commissionFee = roundToDecimals(pos.quantity * xau.commissionPerUnit * 2, 2);
+        const swapPnl = computeOvernightSwapPnl(
+          pos.side,
+          pos.quantity,
+          pos.openedAt,
+          now,
+          xau.overnightSwapLong,
+          xau.overnightSwapShort,
+        );
+        const fee = roundToDecimals(commissionFee + Math.max(0, -swapPnl), 2);
+        const net = roundToDecimals(gross - commissionFee + swapPnl, 2);
         this.serverBot.closedTrades = this.capClosedTrades([
           {
             id: `sbtr-${now}-${Math.random().toString(36).slice(2, 5)}`,
@@ -1510,8 +1925,17 @@ export class LiveMarketEngine {
     const exitMark = pos.side === 'BUY' ? xau.bid : xau.ask;
     const diff = pos.side === 'BUY' ? exitMark - pos.entryPrice : pos.entryPrice - exitMark;
     const gross = roundToDecimals(diff * closeQty * xau.contractSize, 2);
-    const fee = roundToDecimals(closeQty * xau.commissionPerUnit * 2, 2);
-    const net = roundToDecimals(gross - fee, 2);
+    const commissionFee = roundToDecimals(closeQty * xau.commissionPerUnit * 2, 2);
+    const swapPnl = computeOvernightSwapPnl(
+      pos.side,
+      closeQty,
+      pos.openedAt,
+      now,
+      xau.overnightSwapLong,
+      xau.overnightSwapShort,
+    );
+    const fee = roundToDecimals(commissionFee + Math.max(0, -swapPnl), 2);
+    const net = roundToDecimals(gross - commissionFee + swapPnl, 2);
     const exitAction = actualFraction >= 0.999 ? ('CLOSE' as const) : ('PARTIAL_CLOSE' as const);
 
     if (actualFraction >= 0.999) {
@@ -1683,11 +2107,15 @@ export class LiveMarketEngine {
           this.macroGold.live = true;
         }
       })(),
-      // CBOE Gold Volatility (^GVZ), ^VIX & SPDR Gold ETF (GLD) institutional flow (throttled every ~15s)
+      // Institutional Cross-Assets (^GVZ, ^VIX, GLD, TIP, GDX, USDJPY=X, SI=F) & Binance PAXGUSDT Perp OI/Funding (throttled ~12s)
       (async () => {
-        if (Date.now() - this.instFlowLastPollAt < 15_000) return;
-        this.instFlowLastPollAt = Date.now();
-        const [gvzRes, vixRes, gldRes] = await Promise.all([
+        const nowTs = Date.now();
+        if (nowTs - this.instFlowLastPollAt < 12_000) return;
+        this.instFlowLastPollAt = nowTs;
+        const fetchSilverBars = nowTs - this.silverBarsLastPollAt >= 30_000 || this.silver5mCandles.length === 0;
+        if (fetchSilverBars) this.silverBarsLastPollAt = nowTs;
+
+        const [gvzRes, vixRes, gldRes, tipRes, gdxRes, jpyRes, siRes, oiRes, premRes, takerRes] = await Promise.all([
           fetchJsonWithTimeout<YahooChartResponse>(
             'https://query1.finance.yahoo.com/v8/finance/chart/%5EGVZ?range=1d&interval=5m',
             4500,
@@ -1700,7 +2128,38 @@ export class LiveMarketEngine {
             'https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=5m',
             4500,
           ),
+          fetchJsonWithTimeout<YahooChartResponse>(
+            'https://query1.finance.yahoo.com/v8/finance/chart/TIP?range=1d&interval=5m',
+            4500,
+          ),
+          fetchJsonWithTimeout<YahooChartResponse>(
+            'https://query1.finance.yahoo.com/v8/finance/chart/GDX?range=1d&interval=5m',
+            4500,
+          ),
+          fetchJsonWithTimeout<YahooChartResponse>(
+            'https://query1.finance.yahoo.com/v8/finance/chart/USDJPY%3DX?range=1d&interval=5m',
+            4500,
+          ),
+          fetchSilverBars
+            ? fetchJsonWithTimeout<YahooChartResponse>(
+                'https://query1.finance.yahoo.com/v8/finance/chart/SI%3DF?range=1d&interval=5m',
+                4500,
+              )
+            : Promise.resolve(null),
+          fetchJsonWithTimeout<BinanceOpenInterestResponse>(
+            'https://fapi.binance.com/fapi/v1/openInterest?symbol=PAXGUSDT',
+            3500,
+          ),
+          fetchJsonWithTimeout<BinancePremiumIndexResponse>(
+            'https://fapi.binance.com/fapi/v1/premiumIndex?symbol=PAXGUSDT',
+            3500,
+          ),
+          fetchJsonWithTimeout<BinanceTakerRatioRow[]>(
+            'https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=PAXGUSDT&period=5m&limit=3',
+            3500,
+          ),
         ]);
+
         const gvzMeta = gvzRes?.chart?.result?.[0]?.meta;
         if (gvzMeta?.regularMarketPrice) {
           const prev = gvzMeta.chartPreviousClose || gvzMeta.previousClose || gvzMeta.regularMarketPrice;
@@ -1720,7 +2179,83 @@ export class LiveMarketEngine {
           this.instFlow.gldChangePct = prev > 0 ? roundToDecimals(((gldMeta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
           this.instFlow.gldVolume = Math.round(gldMeta.regularMarketVolume || 0);
         }
-        this.instFlow.updatedAt = Date.now();
+        const tipMeta = tipRes?.chart?.result?.[0]?.meta;
+        if (tipMeta?.regularMarketPrice) {
+          const prev = tipMeta.chartPreviousClose || tipMeta.previousClose || tipMeta.regularMarketPrice;
+          this.instFlow.tipPrice = roundToDecimals(tipMeta.regularMarketPrice, 2);
+          this.instFlow.tipChangePct = prev > 0 ? roundToDecimals(((tipMeta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
+        }
+        const gdxMeta = gdxRes?.chart?.result?.[0]?.meta;
+        if (gdxMeta?.regularMarketPrice) {
+          const prev = gdxMeta.chartPreviousClose || gdxMeta.previousClose || gdxMeta.regularMarketPrice;
+          this.instFlow.gdxPrice = roundToDecimals(gdxMeta.regularMarketPrice, 2);
+          this.instFlow.gdxChangePct = prev > 0 ? roundToDecimals(((gdxMeta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
+        }
+        const jpyMeta = jpyRes?.chart?.result?.[0]?.meta;
+        if (jpyMeta?.regularMarketPrice) {
+          const prev = jpyMeta.chartPreviousClose || jpyMeta.previousClose || jpyMeta.regularMarketPrice;
+          this.instFlow.usdJpyPrice = roundToDecimals(jpyMeta.regularMarketPrice, 2);
+          this.instFlow.usdJpyChangePct = prev > 0 ? roundToDecimals(((jpyMeta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
+        }
+
+        const siResult = siRes?.chart?.result?.[0];
+        if (siResult?.meta?.regularMarketPrice) {
+          const prev = siResult.meta.chartPreviousClose || siResult.meta.previousClose || siResult.meta.regularMarketPrice;
+          this.instFlow.silverPrice = roundToDecimals(siResult.meta.regularMarketPrice, 3);
+          this.instFlow.silverChangePct = prev > 0 ? roundToDecimals(((siResult.meta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
+          const tsList = siResult.timestamp || [];
+          const q = siResult.indicators?.quote?.[0];
+          if (tsList.length > 0 && q) {
+            const parsedSi: Candle[] = [];
+            for (let i = 0; i < tsList.length; i++) {
+              const o = q.open?.[i];
+              const h = q.high?.[i];
+              const l = q.low?.[i];
+              const c = q.close?.[i];
+              if (o == null || h == null || l == null || c == null) continue;
+              parsedSi.push({
+                time: tsList[i],
+                open: roundToDecimals(o, 3),
+                high: roundToDecimals(h, 3),
+                low: roundToDecimals(l, 3),
+                close: roundToDecimals(c, 3),
+                volume: Math.round(q.volume?.[i] ?? 50),
+              });
+            }
+            if (parsedSi.length > 0) {
+              this.silver5mCandles = parsedSi.slice(-80);
+            }
+          }
+        }
+
+        const oiNum = oiRes?.openInterest ? parseFloat(oiRes.openInterest) : NaN;
+        const markNum = premRes?.markPrice ? parseFloat(premRes.markPrice) : NaN;
+        const fundNum = premRes?.lastFundingRate ? parseFloat(premRes.lastFundingRate) : NaN;
+        if (Number.isFinite(oiNum) && oiNum > 0) {
+          this.instFlow.futuresOiOz = roundToDecimals(oiNum, 2);
+          const refMark = Number.isFinite(markNum) && markNum > 0 ? markNum : this.instruments.get('XAU/USD')?.price || 0;
+          if (refMark > 0) {
+            this.futuresOiHistory = [
+              ...this.futuresOiHistory.filter((h) => nowTs - h.ts <= 20 * 60_000),
+              {ts: nowTs, oiOz: oiNum, markPrice: refMark},
+            ];
+            const baseline = this.futuresOiHistory.find((h) => nowTs - h.ts >= 60_000) || this.futuresOiHistory[0];
+            if (baseline && baseline.oiOz > 0 && baseline.markPrice > 0) {
+              this.instFlow.futuresOiDeltaPct = roundToDecimals(((oiNum - baseline.oiOz) / baseline.oiOz) * 100, 2);
+              this.instFlow.futuresPriceDeltaPct = roundToDecimals(((refMark - baseline.markPrice) / baseline.markPrice) * 100, 2);
+            }
+          }
+        }
+        if (Number.isFinite(fundNum)) {
+          this.instFlow.futuresFundingRate = Number(fundNum.toFixed(6));
+        }
+        if (Array.isArray(takerRes) && takerRes.length > 0) {
+          const latestRatio = parseFloat(takerRes[takerRes.length - 1]?.buySellRatio || '');
+          if (Number.isFinite(latestRatio) && latestRatio > 0) {
+            this.instFlow.futuresTakerBuySellRatio = roundToDecimals(latestRatio, 2);
+          }
+        }
+        this.instFlow.updatedAt = nowTs;
       })(),
     ]);
 
@@ -1740,13 +2275,29 @@ export class LiveMarketEngine {
     const lastFetch = this.candleFetchedAt.get(cacheKey) || 0;
     const tfMap = this.candleCache.get(symbol)!;
     const existing = tfMap.get(timeframe);
-    if (existing && existing.length > 0 && Date.now() - lastFetch < 25_000) {
+    const mt5Active = symbol === 'XAU/USD' && this.broker.isMt5Configured();
+    const cacheTtlMs = mt5Active && Date.now() - this.mt5LastLiveAt < 8000 ? 4_000 : 10_000;
+    if (existing && existing.length > 0 && Date.now() - lastFetch < cacheTtlMs) {
       return existing;
     }
 
     let parsed: Candle[] = [];
 
-    if (seed.krakenPair) {
+    if (mt5Active) {
+      const mt5Candles = await this.broker.fetchMt5Candles(timeframe, 220);
+      if (mt5Candles && mt5Candles.length > 0) {
+        const inst = this.instruments.get(symbol);
+        if (inst && inst.price > 0 && Date.now() - this.mt5LastLiveAt < 5000) {
+          const lastBar = mt5Candles[mt5Candles.length - 1];
+          lastBar.close = inst.price;
+          lastBar.high = Math.max(lastBar.high, inst.price);
+          lastBar.low = Math.min(lastBar.low, inst.price);
+        }
+        parsed = mt5Candles.slice(-220);
+      }
+    }
+
+    if (parsed.length === 0 && seed.krakenPair) {
       const intervalMap: Record<Timeframe, number> = {
         '1m': 1,
         '5m': 5,
@@ -1773,7 +2324,7 @@ export class LiveMarketEngine {
           volume: Math.round(parseFloat(r[6]) * 100) / 100,
         }));
       }
-    } else if (seed.yahooSymbol) {
+    } else if (parsed.length === 0 && seed.yahooSymbol) {
       const yahooParams: Record<Timeframe, {interval: string; range: string}> = {
         '1m': {interval: '1m', range: '1d'},
         '5m': {interval: '5m', range: '5d'},
@@ -1840,6 +2391,251 @@ export class LiveMarketEngine {
 
   getMarkets(): Instrument[] {
     return Array.from(this.instruments.values());
+  }
+
+  private buildGoldCompactBook(
+    bid: number,
+    ask: number,
+    decimals: number,
+  ): {bids: OrderBookLevel[]; asks: OrderBookLevel[]} {
+    const mid = (bid + ask) / 2;
+    const step = 0.5;
+    const bidMap = new Map<number, number>();
+    const askMap = new Map<number, number>();
+    for (const row of this.goldL2Raw.bids) {
+      if (row.offset > 0) continue;
+      const lvl = roundToDecimals(Math.floor((mid + row.offset) / step) * step, decimals);
+      if (lvl <= bid) bidMap.set(lvl, (bidMap.get(lvl) || 0) + row.size);
+    }
+    for (const row of this.goldL2Raw.asks) {
+      if (row.offset < 0) continue;
+      const lvl = roundToDecimals(Math.ceil((mid + row.offset) / step) * step, decimals);
+      if (lvl >= ask) askMap.set(lvl, (askMap.get(lvl) || 0) + row.size);
+    }
+    let bCum = 0;
+    const bids: OrderBookLevel[] = Array.from(bidMap.entries())
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, 10)
+      .map(([price, raw]) => {
+        const size = Number(raw.toFixed(2));
+        bCum = Number((bCum + size).toFixed(2));
+        return {price, size, total: bCum};
+      });
+    let aCum = 0;
+    const asks: OrderBookLevel[] = Array.from(askMap.entries())
+      .sort((a, b) => a[0] - b[0])
+      .slice(0, 10)
+      .map(([price, raw]) => {
+        const size = Number(raw.toFixed(2));
+        aCum = Number((aCum + size).toFixed(2));
+        return {price, size, total: aCum};
+      });
+    return {bids, asks};
+  }
+
+  getDomLevel2(symbol: string, requestedStep?: number): DomLevel2Snapshot | null {
+    const inst = this.instruments.get(symbol);
+    if (!inst) return null;
+    const dec = inst.decimals;
+    const midPrice = roundToDecimals((inst.bid + inst.ask) / 2, dec);
+    const spread = roundToDecimals(Math.max(0, inst.ask - inst.bid), dec);
+    const isGold = symbol === 'XAU/USD' || symbol === 'GC1!';
+    const defaultStep = isGold ? 0.5 : symbol === 'BTC/USD' ? 10 : inst.tickSize * 5;
+    const stepSize =
+      requestedStep && Number.isFinite(requestedStep) && requestedStep > 0
+        ? requestedStep
+        : defaultStep;
+
+    type AggEntry = {size: number; venues: Set<string>};
+    const bidBuckets = new Map<number, AggEntry>();
+    const askBuckets = new Map<number, AggEntry>();
+    let isRealL2 = false;
+    let sourceLabel = 'Swissquote BBO Spread Tiers (Synthetic Depth)';
+
+    if (isGold && this.goldL2Raw.bids.length > 0 && this.goldL2Raw.asks.length > 0) {
+      isRealL2 = true;
+      sourceLabel = `Real Multi-Venue L2 (${this.goldL2Raw.venues.join(' + ')} PAXG · Spot-Aligned)`;
+      for (const b of this.goldL2Raw.bids) {
+        if (b.offset > 0.05) continue;
+        const rawPx = midPrice + b.offset;
+        const bucket = roundToDecimals(Math.floor(rawPx / stepSize) * stepSize, dec);
+        const existing = bidBuckets.get(bucket) || {size: 0, venues: new Set<string>()};
+        existing.size += b.size;
+        existing.venues.add(b.venue);
+        bidBuckets.set(bucket, existing);
+      }
+      for (const a of this.goldL2Raw.asks) {
+        if (a.offset < -0.05) continue;
+        const rawPx = midPrice + a.offset;
+        const bucket = roundToDecimals(Math.ceil(rawPx / stepSize) * stepSize, dec);
+        const existing = askBuckets.get(bucket) || {size: 0, venues: new Set<string>()};
+        existing.size += a.size;
+        existing.venues.add(a.venue);
+        askBuckets.set(bucket, existing);
+      }
+    } else if (symbol === 'BTC/USD' && this.btcL2Raw.bids.length > 0) {
+      isRealL2 = true;
+      sourceLabel = 'Real Kraken L2 Order Book (XBT/USD · 40 Levels)';
+      for (const b of this.btcL2Raw.bids) {
+        const bucket = roundToDecimals(Math.floor(b.price / stepSize) * stepSize, dec);
+        const existing = bidBuckets.get(bucket) || {size: 0, venues: new Set<string>()};
+        existing.size += b.size;
+        existing.venues.add('Kraken');
+        bidBuckets.set(bucket, existing);
+      }
+      for (const a of this.btcL2Raw.asks) {
+        const bucket = roundToDecimals(Math.ceil(a.price / stepSize) * stepSize, dec);
+        const existing = askBuckets.get(bucket) || {size: 0, venues: new Set<string>()};
+        existing.size += a.size;
+        existing.venues.add('Kraken');
+        askBuckets.set(bucket, existing);
+      }
+    } else {
+      for (const b of inst.bids) {
+        const bucket = roundToDecimals(b.price, dec);
+        const existing = bidBuckets.get(bucket) || {size: 0, venues: new Set<string>()};
+        existing.size += b.size;
+        existing.venues.add(inst.dataSource || 'Feed');
+        bidBuckets.set(bucket, existing);
+      }
+      for (const a of inst.asks) {
+        const bucket = roundToDecimals(a.price, dec);
+        const existing = askBuckets.get(bucket) || {size: 0, venues: new Set<string>()};
+        existing.size += a.size;
+        existing.venues.add(inst.dataSource || 'Feed');
+        askBuckets.set(bucket, existing);
+      }
+    }
+
+    const rawBids = Array.from(bidBuckets.entries())
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, 22);
+    const rawAsks = Array.from(askBuckets.entries())
+      .sort((a, b) => a[0] - b[0])
+      .slice(0, 22);
+
+    const avgBid =
+      rawBids.length > 0
+        ? rawBids.reduce((s, [, v]) => s + v.size, 0) / rawBids.length
+        : 0;
+    const avgAsk =
+      rawAsks.length > 0
+        ? rawAsks.reduce((s, [, v]) => s + v.size, 0) / rawAsks.length
+        : 0;
+    const bidWallThreshold = avgBid * 1.85;
+    const askWallThreshold = avgAsk * 1.85;
+
+    let bidCum = 0;
+    const bids = rawBids.map(([price, entry]) => {
+      const size = Number(entry.size.toFixed(symbol === 'BTC/USD' ? 3 : 2));
+      bidCum = Number((bidCum + size).toFixed(2));
+      return {
+        price,
+        size,
+        total: bidCum,
+        isWall: size > 0 && size >= bidWallThreshold,
+        venues: Array.from(entry.venues).join('+'),
+      };
+    });
+
+    let askCum = 0;
+    const asks = rawAsks.map(([price, entry]) => {
+      const size = Number(entry.size.toFixed(symbol === 'BTC/USD' ? 3 : 2));
+      askCum = Number((askCum + size).toFixed(2));
+      return {
+        price,
+        size,
+        total: askCum,
+        isWall: size > 0 && size >= askWallThreshold,
+        venues: Array.from(entry.venues).join('+'),
+      };
+    });
+
+    const top5Bid = bids.slice(0, 5).reduce((s, l) => s + l.size, 0);
+    const top5Ask = asks.slice(0, 5).reduce((s, l) => s + l.size, 0);
+    const top5Total = top5Bid + top5Ask;
+    const top5BidRatioPct = top5Total > 0 ? Math.round((top5Bid / top5Total) * 100) : 50;
+
+    const totalBidLiquidity = Number(bids.reduce((s, l) => s + l.size, 0).toFixed(2));
+    const totalAskLiquidity = Number(asks.reduce((s, l) => s + l.size, 0).toFixed(2));
+    const fullTotal = totalBidLiquidity + totalAskLiquidity;
+    const fullBookBidRatioPct = fullTotal > 0 ? Math.round((totalBidLiquidity / fullTotal) * 100) : 50;
+
+    const bestBid = bids[0]?.price ?? inst.bid;
+    const bestAsk = asks[0]?.price ?? inst.ask;
+    const bestBidSz = bids[0]?.size ?? 1;
+    const bestAskSz = asks[0]?.size ?? 1;
+    const microPrice =
+      bestBidSz + bestAskSz > 0
+        ? roundToDecimals((bestBid * bestAskSz + bestAsk * bestBidSz) / (bestBidSz + bestAskSz), dec)
+        : midPrice;
+    const microPriceDelta = roundToDecimals(microPrice - midPrice, Math.max(dec, 3));
+
+    const wallBidRow = bids.find((b) => b.isWall) || [...bids].sort((a, b) => b.size - a.size)[0] || null;
+    const wallAskRow = asks.find((a) => a.isWall) || [...asks].sort((a, b) => b.size - a.size)[0] || null;
+
+    const nearestBidWall: DomWallInfo | null = wallBidRow
+      ? {
+          side: 'BID',
+          price: wallBidRow.price,
+          size: wallBidRow.size,
+          distanceDollars: roundToDecimals(Math.max(0, midPrice - wallBidRow.price), dec),
+          venueLabel: wallBidRow.venues || 'Book',
+        }
+      : null;
+
+    const nearestAskWall: DomWallInfo | null = wallAskRow
+      ? {
+          side: 'ASK',
+          price: wallAskRow.price,
+          size: wallAskRow.size,
+          distanceDollars: roundToDecimals(Math.max(0, wallAskRow.price - midPrice), dec),
+          venueLabel: wallAskRow.venues || 'Book',
+        }
+      : null;
+
+    let wallVelocity: DomWallVelocity = 'BALANCED';
+    let bidWallDelta = 0;
+    let askWallDelta = 0;
+    if (isGold && this.goldL2History.length >= 2) {
+      const latestHist = this.goldL2History[this.goldL2History.length - 1];
+      const refHist =
+        [...this.goldL2History].reverse().find((h) => latestHist.ts - h.ts >= 3500) ||
+        this.goldL2History[0];
+      const vel = classifyDomWallVelocity(
+        refHist.top5Bid,
+        refHist.top5Ask,
+        latestHist.top5Bid,
+        latestHist.top5Ask,
+      );
+      wallVelocity = vel.velocity;
+      bidWallDelta = vel.bidDelta;
+      askWallDelta = vel.askDelta;
+    }
+
+    return {
+      symbol,
+      sourceLabel,
+      isRealL2,
+      timestamp: Date.now(),
+      midPrice,
+      microPrice,
+      microPriceDelta,
+      spread,
+      stepSize,
+      top5BidRatioPct,
+      fullBookBidRatioPct,
+      totalBidLiquidity,
+      totalAskLiquidity,
+      nearestBidWall,
+      nearestAskWall,
+      wallVelocity,
+      bidWallDelta,
+      askWallDelta,
+      asks,
+      bids,
+      tiers: this.spreadTiers.get(symbol) || [],
+    };
   }
 
   getOrderFlow(symbol: string): {
@@ -1927,6 +2723,26 @@ export class LiveMarketEngine {
       }
     }
 
+    if (this.instFlow.tipPrice !== null) {
+      if (this.instFlow.tipChangePct >= 0.12) {
+        score += 2;
+        notes.push(`TIP +${this.instFlow.tipChangePct}% (Real Yields ↓)`);
+      } else if (this.instFlow.tipChangePct <= -0.12) {
+        score -= 2;
+        notes.push(`TIP ${this.instFlow.tipChangePct}% (Real Yields ↑)`);
+      }
+    }
+
+    if (this.instFlow.gdxPrice !== null) {
+      if (this.instFlow.gdxChangePct >= 0.4) {
+        score += 2;
+        notes.push(`GDX +${this.instFlow.gdxChangePct}%`);
+      } else if (this.instFlow.gdxChangePct <= -0.4) {
+        score -= 2;
+        notes.push(`GDX ${this.instFlow.gdxChangePct}%`);
+      }
+    }
+
     if (this.instFlow.paxgBuyVolumeOz + this.instFlow.paxgSellVolumeOz > 0) {
       if (this.instFlow.paxgBuyPct >= 56) {
         score += 3;
@@ -1935,6 +2751,41 @@ export class LiveMarketEngine {
         score -= 3;
         notes.push(`PAXG Flow ${100 - this.instFlow.paxgBuyPct}% Sell`);
       }
+    }
+
+    const xau5m = this.candleCache.get('XAU/USD')?.get('5m') || this.candleCache.get('XAU/USD')?.get('15m') || [];
+    const smtDivergence = detectSilverGoldSmt(xau5m, this.silver5mCandles);
+    if (smtDivergence === 'BULLISH_SMT') {
+      score += 2;
+      notes.push('Bullish Gold/Silver SMT');
+    } else if (smtDivergence === 'BEARISH_SMT') {
+      score -= 2;
+      notes.push('Bearish Gold/Silver SMT');
+    }
+
+    const xauChangeDelta = this.instFlow.futuresPriceDeltaPct || 0;
+    const futuresRegime: FuturesOiRegime = classifyFuturesOiRegime(
+      xauChangeDelta,
+      this.instFlow.futuresOiDeltaPct,
+    );
+    if (futuresRegime === 'NEW_LONGS') {
+      score += 2;
+      notes.push(`Perp OI +${this.instFlow.futuresOiDeltaPct}% New Longs`);
+    } else if (futuresRegime === 'NEW_SHORTS') {
+      score -= 2;
+      notes.push(`Perp OI +${this.instFlow.futuresOiDeltaPct}% New Shorts`);
+    } else if (futuresRegime === 'SHORT_COVERING') {
+      notes.push('Short-Covering Squeeze (OI ↓)');
+    } else if (futuresRegime === 'LONG_LIQUIDATION') {
+      notes.push('Long Liquidation Flush (OI ↓)');
+    }
+
+    const goldDom = this.getDomLevel2('XAU/USD', 0.5);
+    if (goldDom && goldDom.isRealL2) {
+      if (goldDom.top5BidRatioPct >= 60 && goldDom.microPriceDelta > 0) score += 1;
+      else if (goldDom.top5BidRatioPct <= 40 && goldDom.microPriceDelta < 0) score -= 1;
+      if (goldDom.wallVelocity === 'PULLING_ASKS' || goldDom.wallVelocity === 'STACKING_BIDS') score += 1;
+      else if (goldDom.wallVelocity === 'PULLING_BIDS' || goldDom.wallVelocity === 'STACKING_ASKS') score -= 1;
     }
 
     const volatilityAlert = Boolean(
@@ -1964,6 +2815,29 @@ export class LiveMarketEngine {
       paxgBuyPct: this.instFlow.paxgBuyPct,
       paxgBookBidPct: this.instFlow.paxgBookBidPct,
       paxgLargePrints: this.instFlow.paxgLargePrints,
+      l2Top5BidPct: goldDom?.top5BidRatioPct,
+      l2FullBidPct: goldDom?.fullBookBidRatioPct,
+      l2MicroTiltDollars: goldDom?.microPriceDelta,
+      l2NearestBidWall: goldDom?.nearestBidWall ?? null,
+      l2NearestAskWall: goldDom?.nearestAskWall ?? null,
+      l2SourceSummary: goldDom?.sourceLabel,
+      l2WallVelocity: goldDom?.wallVelocity ?? 'BALANCED',
+      l2BidWallDelta: goldDom?.bidWallDelta ?? 0,
+      l2AskWallDelta: goldDom?.askWallDelta ?? 0,
+      futuresOiOz: this.instFlow.futuresOiOz,
+      futuresOiDeltaPct: this.instFlow.futuresOiDeltaPct,
+      futuresFundingRate: this.instFlow.futuresFundingRate,
+      futuresTakerBuySellRatio: this.instFlow.futuresTakerBuySellRatio,
+      futuresRegime,
+      tipPrice: this.instFlow.tipPrice,
+      tipChangePct: this.instFlow.tipChangePct,
+      gdxPrice: this.instFlow.gdxPrice,
+      gdxChangePct: this.instFlow.gdxChangePct,
+      silverPrice: this.instFlow.silverPrice,
+      silverChangePct: this.instFlow.silverChangePct,
+      usdJpyPrice: this.instFlow.usdJpyPrice,
+      usdJpyChangePct: this.instFlow.usdJpyChangePct,
+      smtDivergence,
       compositeBias,
       compositeScore: score,
       volatilityAlert,

@@ -1,4 +1,5 @@
 import React, {type Dispatch, type SetStateAction} from 'react';
+import {DomLevel2Panel} from '../../components/DomLevel2Panel';
 import {EconomicCalendarPanel} from '../../components/EconomicCalendarPanel';
 import {ORBAnalysisPanel} from '../../components/ORBAnalysisPanel';
 import {OrderFlowPanel} from '../../components/OrderFlowPanel';
@@ -102,7 +103,7 @@ export function CenterStrategyPanel({
           <button
             type="button"
             onClick={() => setCenterSubTab('XAU_BOT')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
               centerSubTab === 'XAU_BOT'
                 ? 'bg-blue-600 text-white'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -113,8 +114,19 @@ export function CenterStrategyPanel({
           </button>
           <button
             type="button"
+            onClick={() => setCenterSubTab('DOM_L2')}
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+              centerSubTab === 'DOM_L2'
+                ? 'bg-blue-600 text-white'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+            }`}
+          >
+            DOM Level 2
+          </button>
+          <button
+            type="button"
             onClick={() => setCenterSubTab('ORDER_FLOW')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
               centerSubTab === 'ORDER_FLOW'
                 ? 'bg-blue-600 text-white'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
@@ -203,6 +215,16 @@ export function CenterStrategyPanel({
             } catch {
               // Ignore
             }
+          }}
+        />
+      ) : centerSubTab === 'DOM_L2' ? (
+        <DomLevel2Panel
+          instrument={selectedInstrument}
+          orderFlow={orderFlowSnapshot}
+          isOnline={isOnline}
+          onStageOrder={(preset) => {
+            setStagedOrderPreset(preset);
+            setMobileTradePanel('ORDER');
           }}
         />
       ) : centerSubTab === 'ORDER_FLOW' ? (

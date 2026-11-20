@@ -27,6 +27,12 @@ class FakeMt5:
     ORDER_TIME_GTC = 0
     DEAL_TYPE_BUY = 0
     DEAL_TYPE_SELL = 1
+    TIMEFRAME_M1 = 1
+    TIMEFRAME_M5 = 5
+    TIMEFRAME_M15 = 15
+    TIMEFRAME_H1 = 16385
+    TIMEFRAME_H4 = 16388
+    TIMEFRAME_D1 = 16408
 
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
@@ -69,7 +75,21 @@ class FakeMt5:
         return True
 
     def symbol_info_tick(self, _symbol: str) -> Any:
-        return SimpleNamespace(bid=2400.10, ask=2400.40)
+        return SimpleNamespace(bid=2400.10, ask=2400.40, last=2400.25, time=0)
+
+    def copy_rates_from_pos(self, _symbol: str, _tf: int, _start: int, count: int) -> list[dict[str, Any]]:
+        base = 1700000000
+        return [
+            {
+                "time": base + i * 900,
+                "open": 2398.0 + i * 0.5,
+                "high": 2401.0 + i * 0.5,
+                "low": 2397.5 + i * 0.5,
+                "close": 2400.0 + i * 0.5,
+                "tick_volume": 120 + i,
+            }
+            for i in range(min(count, 12))
+        ]
 
     def order_send(self, request: dict[str, Any]) -> Any:
         self.sent.append(request)
@@ -168,6 +188,29 @@ class GatewayTests(unittest.TestCase):
         self.api.history_deals_get = lambda *_a: None  # type: ignore[method-assign]
         self.assertIsNone(self.gw.account()["dayPnl"])
 
+    def test_quote_returns_bid_ask_and_spread(self) -> None:
+        q = self.gw.quote({"symbol": ["XAUUSD"]})
+        self.assertEqual(q["symbol"], "XAUUSD")
+        self.assertEqual(q["bid"], 2400.10)
+        self.assertEqual(q["ask"], 2400.40)
+        self.assertEqual(q["spread"], 0.30)
+
+    def test_candles_normalizes_bars_and_rejects_bad_timeframe(self) -> None:
+        res = self.gw.candles({"symbol": ["XAUUSD"], "timeframe": ["15m"], "count": ["12"]})
+        self.assertEqual(res["timeframe"], "15m")
+        self.assertEqual(len(res["candles"]), 12)
+        self.assertEqual(res["candles"][0], {
+            "time": 1700000000,
+            "open": 2398.0,
+            "high": 2401.0,
+            "low": 2397.5,
+            "close": 2400.0,
+            "volume": 120,
+        })
+        with self.assertRaises(bridge.BridgeError) as ctx:
+            self.gw.candles({"symbol": ["XAUUSD"], "timeframe": ["2H"]})
+        self.assertEqual(ctx.exception.status, 400)
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -212,6 +255,15 @@ class HttpTests(unittest.TestCase):
         status, body = self._call("/orders/open", {"symbol": "XAUUSD", "side": "BUY", "lots": "lots", "stopLoss": 1, "takeProfit": 2})
         self.assertEqual(status, 400)
         self.assertIn("lots", body["error"])
+
+    def test_quote_and_candles_http_roundtrip(self) -> None:
+        qs, qbody = self._call("/quote?symbol=XAUUSD")
+        self.assertEqual(qs, 200)
+        self.assertEqual(qbody["bid"], 2400.10)
+        cs, cbody = self._call("/candles?symbol=XAUUSD&timeframe=5m&count=10")
+        self.assertEqual(cs, 200)
+        self.assertEqual(cbody["timeframe"], "5m")
+        self.assertEqual(len(cbody["candles"]), 10)
 
 
 if __name__ == "__main__":

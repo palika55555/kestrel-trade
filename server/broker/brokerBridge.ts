@@ -21,7 +21,7 @@ import {roundToDecimals} from '../marketUtils.ts';
 import {CTraderTokenStore} from './ctrader/oauth.ts';
 import {CTraderService, readCTraderConfig} from './ctrader/service.ts';
 import {type LiveRiskDecision, type LiveRiskInput, evaluateLiveRisk, readLiveRiskLimits} from './liveRiskGuard.ts';
-import {type FetchLike, Mt5BridgeClient, readMt5Config} from './mt5/client.ts';
+import {type FetchLike, Mt5BridgeClient, type Mt5Quote, readMt5Config} from './mt5/client.ts';
 
 const CTRADER_TOKEN_FILE = path.join(SERVER_DATA_DIR, 'ctrader-tokens.json');
 
@@ -248,6 +248,45 @@ export class BrokerBridge {
   }
 
   private syncInFlight = false;
+  private mt5FeedBackoffUntil = 0;
+
+  isMt5Configured(): boolean {
+    const env = this.detectBrokerEnv();
+    return env.provider === 'MT5' && env.configured;
+  }
+
+  /** Fetches the latest XAU quote from the local MT5 terminal; returns null with short backoff if offline. */
+  async fetchMt5Quote(): Promise<Mt5Quote | null> {
+    if (Date.now() < this.mt5FeedBackoffUntil) return null;
+    const env = this.detectBrokerEnv();
+    if (env.provider !== 'MT5' || !env.configured) return null;
+    try {
+      const q = await env.mt5.getQuote();
+      this.mt5FeedBackoffUntil = 0;
+      return q;
+    } catch {
+      this.mt5FeedBackoffUntil = Date.now() + 8000;
+      return null;
+    }
+  }
+
+  /** Fetches OHLCV candles from the local MT5 terminal; returns null with short backoff if offline. */
+  async fetchMt5Candles(timeframe: Timeframe, count = 220): Promise<Candle[] | null> {
+    if (Date.now() < this.mt5FeedBackoffUntil) return null;
+    const env = this.detectBrokerEnv();
+    if (env.provider !== 'MT5' || !env.configured) return null;
+    try {
+      const candles = await env.mt5.getCandles(timeframe, count);
+      if (candles.length > 0) {
+        this.mt5FeedBackoffUntil = 0;
+        return candles;
+      }
+      return null;
+    } catch {
+      this.mt5FeedBackoffUntil = Date.now() + 8000;
+      return null;
+    }
+  }
 
   /** Keeps the cached broker account fresh while live routing is armed. Never overlaps itself. */
   async refreshIfRouting(): Promise<void> {
@@ -280,6 +319,7 @@ export class BrokerBridge {
   }
 
   async syncBrokerAccount(): Promise<BrokerStatus> {
+    this.mt5FeedBackoffUntil = 0;
     const env = this.detectBrokerEnv();
     if (!env.configured) {
       this.brokerCache.lastError = null;
