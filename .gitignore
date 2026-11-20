@@ -9,3 +9,4 @@ coverage/
 dev-dist/
 server.mjs
 .kestrel-server-bot.json
+data/

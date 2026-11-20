@@ -7,6 +7,7 @@ import {
   verifyBiometricCredential,
 } from '../services/biometricAuth';
 import type {RiskSettings, SecurityState} from '../types/trading';
+import {AuditLogPanel} from './AuditLogPanel';
 
 interface SecurityViewProps {
   securityState: SecurityState;
@@ -274,6 +275,8 @@ export const SecurityView: React.FC<SecurityViewProps> = ({
           <span>Lock Terminal Now</span>
         </button>
       </div>
+
+      <AuditLogPanel />
     </div>
   );
 };

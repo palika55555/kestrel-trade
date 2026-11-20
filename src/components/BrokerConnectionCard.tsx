@@ -27,7 +27,7 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
   const [syncing, setSyncing] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [showSetupGuide, setShowSetupGuide] = useState(false);
-  const [selectedGuide, setSelectedGuide] = useState<'OANDA' | 'METAAPI' | 'WEBHOOK'>('OANDA');
+  const [selectedGuide, setSelectedGuide] = useState<'OANDA' | 'METAAPI' | 'CTRADER' | 'WEBHOOK'>('OANDA');
 
   const configured = Boolean(brokerStatus?.configured);
   const armed = Boolean(brokerStatus?.routingArmed);
@@ -189,7 +189,7 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
         <div className="rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2.5 flex items-start gap-2 text-xs text-amber-700 dark:text-amber-300">
           <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
           <div>
-            <strong>Bezpečné serverové pripojenie:</strong> API kľúče brokera sa nikdy neukladajú do prehliadača. Nastav ich ako serverové secrets na Fly.io (`fly secrets set ...`) alebo do `.env` a reštartuj server — potom sa tlačidlo <strong>Arm Real Broker Routing</strong> automaticky odomkne.
+            <strong>Bezpečné serverové pripojenie:</strong> API kľúče brokera sa nikdy neukladajú do prehliadača. Zapíš ich do súboru <code>.env</code> v koreňovom priečinku projektu a reštartuj server — potom sa tlačidlo <strong>Arm Real Broker Routing</strong> automaticky odomkne.
           </div>
         </div>
       )}
@@ -207,10 +207,10 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
         <div className="rounded-lg border border-slate-200 dark:border-[#242E42] bg-slate-50 dark:bg-[#0D1119] p-3.5 space-y-3 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="font-semibold text-slate-900 dark:text-slate-100">
-              Vyber brokera a nastav Fly.io Secrets (server-side):
+              Vyber brokera a doplň kľúče do .env (server-side):
             </span>
             <div className="flex items-center gap-1">
-              {(['OANDA', 'METAAPI', 'WEBHOOK'] as const).map((g) => (
+              {(['OANDA', 'METAAPI', 'CTRADER', 'WEBHOOK'] as const).map((g) => (
                 <button
                   key={g}
                   type="button"
@@ -225,6 +225,8 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
                     ? 'OANDA (XAU/USD)'
                     : g === 'METAAPI'
                     ? 'MT4 / MT5 (MetaApi)'
+                    : g === 'CTRADER'
+                    ? 'cTrader Open API'
                     : 'Custom Webhook'}
                 </button>
               ))}
@@ -237,11 +239,10 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
                 Priame API napojenie na <strong>OANDA v20</strong> (najprv odporúčame <code>practice</code> demo účet, neskôr prepnúť <code>OANDA_ENV=live</code>):
               </p>
               <pre className="p-2.5 rounded bg-slate-900 text-emerald-300 font-mono text-[11px] overflow-x-auto">
-{`fly secrets set \\
-  OANDA_API_TOKEN="tvoj_oanda_token" \\
-  OANDA_ACCOUNT_ID="101-004-XXXXXXX-001" \\
-  OANDA_ENV="practice" \\
-  -a kestrel-trade`}
+{`# .env
+OANDA_API_TOKEN="tvoj_oanda_token"
+OANDA_ACCOUNT_ID="101-004-XXXXXXX-001"
+OANDA_ENV="practice"`}
               </pre>
             </div>
           )}
@@ -252,12 +253,32 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
                 Pre ľubovoľného <strong>MT4 / MT5 brokera</strong> (IC Markets, Pepperstone, FTMO, XM, Exness...) cez <strong>MetaApi Cloud</strong>:
               </p>
               <pre className="p-2.5 rounded bg-slate-900 text-emerald-300 font-mono text-[11px] overflow-x-auto">
-{`fly secrets set \\
-  METAAPI_TOKEN="tvoj_metaapi_token" \\
-  METAAPI_ACCOUNT_ID="uuid_uctu_z_metaapi" \\
-  METAAPI_SYMBOL_XAU="XAUUSD" \\
-  -a kestrel-trade`}
+{`# .env
+METAAPI_TOKEN="tvoj_metaapi_token"
+METAAPI_ACCOUNT_ID="uuid_uctu_z_metaapi"
+METAAPI_SYMBOL_XAU="XAUUSD"`}
               </pre>
+            </div>
+          )}
+
+          {selectedGuide === 'CTRADER' && (
+            <div className="space-y-2 text-slate-600 dark:text-slate-300">
+              <p>
+                Priame napojenie na <strong>cTrader Open API</strong> bez MetaApi. Zaregistruj aplikáciu na openapi.ctrader.com s Redirect URL nižšie, doplň kľúče, reštartuj server a klikni na Pripojiť:
+              </p>
+              <pre className="p-2.5 rounded bg-slate-900 text-emerald-300 font-mono text-[11px] overflow-x-auto">
+{`# .env
+CTRADER_CLIENT_ID="tvoj_client_id"
+CTRADER_CLIENT_SECRET="tvoj_client_secret"
+CTRADER_REDIRECT_URI="http://localhost:3000/api/ctrader/callback"
+CTRADER_ENV="demo"`}
+              </pre>
+              <a
+                href="/api/ctrader/connect"
+                className="inline-block px-3 py-1.5 rounded bg-blue-600 text-white font-medium hover:bg-blue-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400"
+              >
+                Pripojiť cTrader účet
+              </a>
             </div>
           )}
 
@@ -267,10 +288,9 @@ export const BrokerConnectionCard: React.FC<BrokerConnectionCardProps> = ({
                 Pre vlastný MT5 Python bridge / cTrader / webhook endpoint (server odošle JSON pre OPEN, CLOSE, PARTIAL_CLOSE):
               </p>
               <pre className="p-2.5 rounded bg-slate-900 text-emerald-300 font-mono text-[11px] overflow-x-auto">
-{`fly secrets set \\
-  BROKER_WEBHOOK_URL="https://tvoj-bridge.example.com/trade" \\
-  BROKER_WEBHOOK_SECRET="tajny_bearer_kluc" \\
-  -a kestrel-trade`}
+{`# .env
+BROKER_WEBHOOK_URL="https://tvoj-bridge.example.com/trade"
+BROKER_WEBHOOK_SECRET="tajny_bearer_kluc"`}
               </pre>
             </div>
           )}

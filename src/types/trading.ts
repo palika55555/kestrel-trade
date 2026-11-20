@@ -585,7 +585,7 @@ export interface EconomicCalendarSnapshot {
   updatedAt: number;
 }
 
-export type BrokerProvider = 'SIMULATION' | 'OANDA' | 'METAAPI' | 'WEBHOOK';
+export type BrokerProvider = 'SIMULATION' | 'OANDA' | 'METAAPI' | 'CTRADER' | 'WEBHOOK';
 
 export interface BrokerStatus {
   provider: BrokerProvider;
