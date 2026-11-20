@@ -396,6 +396,27 @@ export interface VolumeProfileRow {
   inValueArea: boolean;
 }
 
+export interface FootprintClusterRow {
+  priceLow: number;
+  priceHigh: number;
+  priceMid: number;
+  bidVolume: number;
+  askVolume: number;
+  delta: number;
+  totalVolume: number;
+  imbalance: 'BUY' | 'SELL' | 'NONE';
+  isBarPoc: boolean;
+}
+
+export interface BarDeltaPoint {
+  time: number;
+  delta: number;
+  cvd: number;
+  buyVolume: number;
+  sellVolume: number;
+  totalVolume: number;
+}
+
 export interface OrderFlowSnapshot {
   symbol: string;
   timestamp: number;
@@ -414,6 +435,11 @@ export interface OrderFlowSnapshot {
   vahPrice: number;
   valPrice: number;
   volumeProfile: VolumeProfileRow[];
+  footprintClusters: FootprintClusterRow[];
+  barDeltas: BarDeltaPoint[];
+  stackedImbalance: 'BULLISH_STACK' | 'BEARISH_STACK' | 'NONE';
+  absorptionSignal: 'BULLISH_ABSORPTION' | 'BEARISH_ABSORPTION' | 'NONE';
+  cvdDivergence: 'BULLISH' | 'BEARISH' | 'NONE';
   liquidityZones: LiquidityZone[];
   verdict: 'STRONG_BUY' | 'BUY' | 'NEUTRAL' | 'SELL' | 'STRONG_SELL';
   verdictScore: number; // 0-100 bullishness
@@ -433,6 +459,49 @@ export interface OrderFlowSnapshot {
     takeProfit: number;
     rationale: string;
   };
+}
+
+export interface CotPositioning {
+  marketName: string;
+  reportDate: string;
+  openInterest: number;
+  managedMoneyLong: number;
+  managedMoneyShort: number;
+  managedMoneyNet: number;
+  managedMoneyNetChange: number;
+  commercialNet: number;
+  swapDealerNet: number;
+  retailNet: number;
+  bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+}
+
+export interface InstitutionalGoldContext {
+  cot: CotPositioning | null;
+  gvz: number | null;
+  gvzChangePct: number;
+  vix: number | null;
+  vixChangePct: number;
+  gldPrice: number | null;
+  gldChangePct: number;
+  gldVolume: number;
+  paxgPrice: number | null;
+  paxgBuyVolumeOz: number;
+  paxgSellVolumeOz: number;
+  paxgNetDeltaOz: number;
+  paxgBuyPct: number;
+  paxgBookBidPct: number;
+  paxgLargePrints: Array<{
+    id: string;
+    price: number;
+    sizeOz: number;
+    side: OrderSide;
+    timestamp: number;
+  }>;
+  compositeBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  compositeScore: number;
+  volatilityAlert: boolean;
+  summary: string;
+  updatedAt: number;
 }
 
 export interface MacroGoldContext {

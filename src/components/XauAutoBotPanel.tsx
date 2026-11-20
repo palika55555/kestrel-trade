@@ -576,6 +576,42 @@ export const XauAutoBotPanel: React.FC<XauAutoBotPanelProps> = ({
                   {evaluation.sessionInfo.sessionLabel} · Spread $
                   {evaluation.sessionInfo.spreadDollars.toFixed(2)}
                 </span>
+                {evaluation.atasSignals && (
+                  <span>
+                    ATAS:{' '}
+                    {evaluation.atasSignals.stackedImbalance !== 'NONE'
+                      ? evaluation.atasSignals.stackedImbalance.replace('_', ' ')
+                      : evaluation.atasSignals.absorptionSignal !== 'NONE'
+                      ? evaluation.atasSignals.absorptionSignal.replace('_', ' ')
+                      : evaluation.atasSignals.cvdDivergence !== 'NONE'
+                      ? `CVD ${evaluation.atasSignals.cvdDivergence}`
+                      : 'Balanced'}
+                  </span>
+                )}
+                {evaluation.institutional && (
+                  <>
+                    <span>
+                      PAXG {evaluation.institutional.paxgBuyPct}% Buy
+                    </span>
+                    {evaluation.institutional.gvz !== null && (
+                      <span className={evaluation.institutional.volatilityAlert ? 'text-amber-500 font-semibold' : ''}>
+                        GVZ {evaluation.institutional.gvz.toFixed(1)}
+                      </span>
+                    )}
+                    {evaluation.institutional.gldPrice !== null && (
+                      <span>
+                        GLD {evaluation.institutional.gldChangePct >= 0 ? '+' : ''}
+                        {evaluation.institutional.gldChangePct}%
+                      </span>
+                    )}
+                    {evaluation.institutional.cot && (
+                      <span>
+                        COT MM {evaluation.institutional.cot.managedMoneyNet >= 0 ? '+' : ''}
+                        {Math.round(evaluation.institutional.cot.managedMoneyNet / 1000)}k
+                      </span>
+                    )}
+                  </>
+                )}
               </div>
             )}
           </div>

@@ -1,7 +1,8 @@
 import React from 'react';
-import {Activity, ArrowDownRight, ArrowUpRight, Layers} from 'lucide-react';
+import {Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, BarChart3, Building2, Layers} from 'lucide-react';
 import {formatPrice} from '../services/tradingMath';
 import type {
+  InstitutionalGoldContext,
   Instrument,
   OrderFlowSnapshot,
   StagedOrderPreset,
@@ -10,12 +11,14 @@ import type {
 interface OrderFlowPanelProps {
   instrument: Instrument;
   snapshot: OrderFlowSnapshot | null;
+  institutional?: InstitutionalGoldContext | null;
   onStageOrder: (preset: StagedOrderPreset) => void;
 }
 
 export const OrderFlowPanel: React.FC<OrderFlowPanelProps> = ({
   instrument,
   snapshot,
+  institutional,
   onStageOrder,
 }) => {
   if (!snapshot) {
@@ -305,6 +308,432 @@ export const OrderFlowPanel: React.FC<OrderFlowPanelProps> = ({
           </div>
         </div>
       </div>
+
+      {/* ATAS Footprint Price Clusters & 12-Bar Delta Histogram */}
+      {(snapshot.footprintClusters?.length > 0 || snapshot.barDeltas?.length > 0) && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-1 border-t border-slate-200 dark:border-[#1E2636]">
+          {/* Footprint Clusters (Bid x Ask + 2.4x Imbalance) */}
+          <div className="lg:col-span-7 rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                <BarChart3 className="w-3.5 h-3.5 text-amber-500" />
+                ATAS Footprint Clusters (Bid × Ask · 2.4x Imbalance)
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5 font-mono text-[10px]">
+                <span
+                  className={`px-1.5 py-0.5 rounded border ${
+                    snapshot.stackedImbalance === 'BULLISH_STACK'
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                      : snapshot.stackedImbalance === 'BEARISH_STACK'
+                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                      : 'border-slate-200 dark:border-[#263042] text-slate-500 dark:text-slate-400'
+                  }`}
+                >
+                  {snapshot.stackedImbalance === 'NONE'
+                    ? 'Stack: Neutral'
+                    : snapshot.stackedImbalance.replace('_', ' ')}
+                </span>
+                {snapshot.absorptionSignal !== 'NONE' && (
+                  <span
+                    className={`px-1.5 py-0.5 rounded border ${
+                      snapshot.absorptionSignal === 'BULLISH_ABSORPTION'
+                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                        : 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                    }`}
+                  >
+                    {snapshot.absorptionSignal.replace('_', ' ')}
+                  </span>
+                )}
+                {snapshot.cvdDivergence !== 'NONE' && (
+                  <span
+                    className={`px-1.5 py-0.5 rounded border ${
+                      snapshot.cvdDivergence === 'BULLISH'
+                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                        : 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                    }`}
+                  >
+                    CVD Div: {snapshot.cvdDivergence}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-12 text-[10px] font-mono uppercase tracking-wider text-slate-400 px-1.5">
+              <span className="col-span-4">Price Level</span>
+              <span className="col-span-5 text-center">Bid Vol × Ask Vol</span>
+              <span className="col-span-3 text-right">Delta</span>
+            </div>
+
+            <div className="space-y-1">
+              {snapshot.footprintClusters.map((row, idx) => {
+                const isCurrent =
+                  instrument.price >= row.priceLow && instrument.price <= row.priceHigh;
+                return (
+                  <div
+                    key={idx}
+                    className={`grid grid-cols-12 items-center gap-2 text-[11px] font-mono tabular-nums px-1.5 py-1 rounded ${
+                      row.isBarPoc
+                        ? 'bg-amber-500/15 border border-amber-500/30 text-amber-700 dark:text-amber-300 font-semibold'
+                        : isCurrent
+                        ? 'bg-blue-500/15 text-blue-700 dark:text-blue-300 font-semibold'
+                        : 'text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    <span className="col-span-4 truncate">
+                      {formatPrice(row.priceMid, dec)}
+                      {row.isBarPoc ? ' POC' : isCurrent ? ' •' : ''}
+                    </span>
+                    <span className="col-span-5 flex items-center justify-center gap-1.5">
+                      <span
+                        className={
+                          row.imbalance === 'SELL'
+                            ? 'px-1 rounded bg-rose-500/20 text-rose-600 dark:text-rose-400 font-bold'
+                            : 'text-rose-600/90 dark:text-rose-400/90'
+                        }
+                      >
+                        {Math.round(row.bidVolume)}
+                      </span>
+                      <span className="text-slate-400">×</span>
+                      <span
+                        className={
+                          row.imbalance === 'BUY'
+                            ? 'px-1 rounded bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 font-bold'
+                            : 'text-emerald-600/90 dark:text-emerald-400/90'
+                        }
+                      >
+                        {Math.round(row.askVolume)}
+                      </span>
+                    </span>
+                    <span
+                      className={`col-span-3 text-right font-semibold ${
+                        row.delta > 0
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : row.delta < 0
+                          ? 'text-rose-600 dark:text-rose-400'
+                          : 'text-slate-400'
+                      }`}
+                    >
+                      {row.delta >= 0 ? '+' : ''}
+                      {Math.round(row.delta)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 12-Bar Delta & CVD Histogram */}
+          <div className="lg:col-span-5 rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 flex flex-col justify-between space-y-2.5">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold text-slate-800 dark:text-slate-200">
+                12-Bar Delta &amp; CVD Flow
+              </span>
+              <span className="font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+                Last Delta{' '}
+                <strong
+                  className={
+                    (snapshot.barDeltas[snapshot.barDeltas.length - 1]?.delta ?? 0) >= 0
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                  }
+                >
+                  {(snapshot.barDeltas[snapshot.barDeltas.length - 1]?.delta ?? 0) >= 0 ? '+' : ''}
+                  {Math.round(snapshot.barDeltas[snapshot.barDeltas.length - 1]?.delta ?? 0)}
+                </strong>
+              </span>
+            </div>
+
+            {(() => {
+              const maxAbsDelta = Math.max(
+                1,
+                ...snapshot.barDeltas.map((b) => Math.abs(b.delta)),
+              );
+              return (
+                <div className="grid grid-cols-12 gap-1 items-end h-32 pt-3 pb-1 px-1 rounded bg-white dark:bg-[#121721] border border-slate-200 dark:border-[#1E2636]">
+                  {snapshot.barDeltas.map((pt, i) => {
+                    const heightPct = Math.max(8, Math.round((Math.abs(pt.delta) / maxAbsDelta) * 100));
+                    const isPos = pt.delta >= 0;
+                    return (
+                      <div key={i} className="flex flex-col items-center justify-end h-full gap-1">
+                        <div className="w-full flex-1 flex items-end justify-center">
+                          <div
+                            title={`Delta ${pt.delta >= 0 ? '+' : ''}${Math.round(pt.delta)} · CVD ${Math.round(pt.cvd)}`}
+                            className={`w-full rounded-xs transition-all ${
+                              isPos ? 'bg-emerald-500/85' : 'bg-rose-500/85'
+                            }`}
+                            style={{height: `${heightPct}%`}}
+                          />
+                        </div>
+                        <span className="text-[9px] font-mono text-slate-400 tabular-nums">
+                          {pt.delta >= 0 ? '+' : '-'}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+
+            <div className="grid grid-cols-2 gap-2 text-[11px] font-mono tabular-nums pt-1">
+              <div className="rounded bg-white dark:bg-[#121721] border border-slate-200 dark:border-[#1E2636] px-2.5 py-1.5">
+                <div className="text-[10px] text-slate-400">Cumulative Delta</div>
+                <div
+                  className={`font-semibold ${
+                    snapshot.cvd >= 0
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                  }`}
+                >
+                  {snapshot.cvd >= 0 ? '+' : ''}
+                  {snapshot.cvd.toLocaleString()}
+                </div>
+              </div>
+              <div className="rounded bg-white dark:bg-[#121721] border border-slate-200 dark:border-[#1E2636] px-2.5 py-1.5">
+                <div className="text-[10px] text-slate-400">ATAS Confluence</div>
+                <div className="font-semibold text-slate-900 dark:text-white truncate">
+                  {snapshot.stackedImbalance !== 'NONE'
+                    ? snapshot.stackedImbalance.replace('_', ' ')
+                    : snapshot.absorptionSignal !== 'NONE'
+                    ? snapshot.absorptionSignal.replace('_', ' ')
+                    : 'Balanced'}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Institutional & Smart Money ("Finance Insider") — CFTC COT, CBOE GVZ/VIX, GLD ETF & Kraken PAXG */}
+      {institutional && (
+        <div className="pt-3 border-t border-slate-200 dark:border-[#1E2636] space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Building2 className="w-4 h-4 text-blue-500 shrink-0" />
+              <div>
+                <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                  Institutional Positioning &amp; Smart Money Flow (COT · Volatility · Physical Gold Tape)
+                </h3>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {institutional.summary}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 font-mono text-[11px]">
+              {institutional.volatilityAlert && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400 font-semibold">
+                  <AlertTriangle className="w-3 h-3" />
+                  GVZ Vol Spike (+5% Conf Floor)
+                </span>
+              )}
+              <span
+                className={`px-2 py-0.5 rounded border font-semibold ${
+                  institutional.compositeBias === 'BULLISH'
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                    : institutional.compositeBias === 'BEARISH'
+                    ? 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                    : 'border-slate-200 dark:border-[#263042] text-slate-600 dark:text-slate-300'
+                }`}
+              >
+                Smart Money: {institutional.compositeBias} ({institutional.compositeScore >= 0 ? '+' : ''}
+                {institutional.compositeScore})
+              </span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+            {/* CFTC COT COMEX Gold */}
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  CFTC COT COMEX Gold
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">
+                  {institutional.cot?.reportDate || 'Pending'}
+                </span>
+              </div>
+              {institutional.cot ? (
+                <div className="space-y-1 font-mono text-[11px] tabular-nums">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500 dark:text-slate-400">Managed Money Net</span>
+                    <span
+                      className={
+                        institutional.cot.managedMoneyNet >= 0
+                          ? 'font-semibold text-emerald-600 dark:text-emerald-400'
+                          : 'font-semibold text-rose-600 dark:text-rose-400'
+                      }
+                    >
+                      {institutional.cot.managedMoneyNet >= 0 ? '+' : ''}
+                      {institutional.cot.managedMoneyNet.toLocaleString()}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500 dark:text-slate-400">Funds WoW Change</span>
+                    <span
+                      className={
+                        institutional.cot.managedMoneyNetChange >= 0
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-rose-600 dark:text-rose-400'
+                      }
+                    >
+                      {institutional.cot.managedMoneyNetChange >= 0 ? '+' : ''}
+                      {institutional.cot.managedMoneyNetChange.toLocaleString()}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                    <span>Comm: {institutional.cot.commercialNet.toLocaleString()}</span>
+                    <span>Retail: {institutional.cot.retailNet.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between text-[10px] text-slate-400">
+                    <span>OI: {institutional.cot.openInterest.toLocaleString()}</span>
+                    <span>Bias: {institutional.cot.bias}</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-[11px] text-slate-400">Syncing CFTC Disaggregated COT...</div>
+              )}
+            </div>
+
+            {/* CBOE Gold Volatility (^GVZ), ^VIX & SPDR GLD ETF */}
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  Options Vol &amp; GLD ETF
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">CBOE / NYSE</span>
+              </div>
+              <div className="space-y-1 font-mono text-[11px] tabular-nums">
+                <div className="flex justify-between">
+                  <span className="text-slate-500 dark:text-slate-400">Gold Vol (^GVZ)</span>
+                  <span className="font-semibold text-slate-900 dark:text-white">
+                    {institutional.gvz !== null ? institutional.gvz.toFixed(2) : '--'}{' '}
+                    <span
+                      className={
+                        institutional.gvzChangePct >= 0 ? 'text-amber-500' : 'text-emerald-500'
+                      }
+                    >
+                      ({institutional.gvzChangePct >= 0 ? '+' : ''}
+                      {institutional.gvzChangePct}%)
+                    </span>
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 dark:text-slate-400">SPX Vol (^VIX)</span>
+                  <span className="text-slate-700 dark:text-slate-200">
+                    {institutional.vix !== null ? institutional.vix.toFixed(2) : '--'}{' '}
+                    <span className="text-slate-400">
+                      ({institutional.vixChangePct >= 0 ? '+' : ''}
+                      {institutional.vixChangePct}%)
+                    </span>
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 dark:text-slate-400">SPDR Gold (GLD)</span>
+                  <span
+                    className={
+                      institutional.gldChangePct >= 0
+                        ? 'font-semibold text-emerald-600 dark:text-emerald-400'
+                        : 'font-semibold text-rose-600 dark:text-rose-400'
+                    }
+                  >
+                    {institutional.gldPrice !== null ? `$${institutional.gldPrice.toFixed(2)}` : '--'}{' '}
+                    ({institutional.gldChangePct >= 0 ? '+' : ''}
+                    {institutional.gldChangePct}%)
+                  </span>
+                </div>
+                <div className="flex justify-between text-[10px] text-slate-400">
+                  <span>GLD Session Vol</span>
+                  <span>{institutional.gldVolume.toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Real Executed Gold Flow (Kraken PAXG/USD 1:1 Physical Gold) */}
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  PAXG/USD Real Prints
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">
+                  {institutional.paxgPrice ? `$${institutional.paxgPrice.toFixed(2)}` : 'Kraken'}
+                </span>
+              </div>
+              <div className="space-y-1.5 font-mono text-[11px] tabular-nums">
+                <div className="flex justify-between font-semibold">
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    Buy {institutional.paxgBuyPct}% ({institutional.paxgBuyVolumeOz.toFixed(2)} oz)
+                  </span>
+                  <span className="text-rose-600 dark:text-rose-400">
+                    Sell {100 - institutional.paxgBuyPct}% ({institutional.paxgSellVolumeOz.toFixed(2)} oz)
+                  </span>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-rose-500/35 overflow-hidden flex">
+                  <div
+                    className="h-full bg-emerald-500"
+                    style={{width: `${institutional.paxgBuyPct}%`}}
+                  />
+                </div>
+                <div className="flex justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                  <span>
+                    Net Delta:{' '}
+                    <strong
+                      className={
+                        institutional.paxgNetDeltaOz >= 0
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-rose-600 dark:text-rose-400'
+                      }
+                    >
+                      {institutional.paxgNetDeltaOz >= 0 ? '+' : ''}
+                      {institutional.paxgNetDeltaOz.toFixed(2)} oz
+                    </strong>
+                  </span>
+                  <span>L2 Book Bid: {institutional.paxgBookBidPct}%</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Institutional Whale Prints Tape (>= 0.2 oz) */}
+            <div className="rounded-lg border border-slate-200 dark:border-[#1E2636] bg-slate-50 dark:bg-[#0D1119] p-3 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  Gold Whale Prints
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">&gt;= 0.20 oz</span>
+              </div>
+              {institutional.paxgLargePrints.length > 0 ? (
+                <div className="space-y-1 max-h-24 overflow-y-auto pr-1 font-mono text-[10px] tabular-nums">
+                  {institutional.paxgLargePrints.slice(0, 6).map((p) => (
+                    <div key={p.id} className="flex items-center justify-between">
+                      <span
+                        className={
+                          p.side === 'BUY'
+                            ? 'font-semibold text-emerald-600 dark:text-emerald-400'
+                            : 'font-semibold text-rose-600 dark:text-rose-400'
+                        }
+                      >
+                        {p.side} {p.sizeOz.toFixed(2)} oz
+                      </span>
+                      <span className="text-slate-600 dark:text-slate-300">
+                        ${p.price.toFixed(2)}
+                      </span>
+                      <span className="text-slate-400">
+                        {new Date(p.timestamp).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        })}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-[11px] text-slate-400">
+                  Waiting for &gt;=0.20 oz physical gold blocks...
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

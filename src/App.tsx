@@ -62,6 +62,7 @@ import type {
   EconomicCalendarSnapshot,
   EODReport,
   ExecutionAction,
+  InstitutionalGoldContext,
   Instrument,
   MacroGoldContext,
   MarketPrint,
@@ -151,6 +152,7 @@ export default function App() {
   const [xauRecentPrints, setXauRecentPrints] = useState<MarketPrint[]>([]);
   const [xauMtfCandles, setXauMtfCandles] = useState<Partial<Record<Timeframe, Candle[]>>>({});
   const [goldMacro, setGoldMacro] = useState<MacroGoldContext | null>(null);
+  const [institutionalGold, setInstitutionalGold] = useState<InstitutionalGoldContext | null>(null);
   const [calendarSnapshot, setCalendarSnapshot] = useState<EconomicCalendarSnapshot | null>(null);
   const [server247Enabled, setServer247Enabled] = useState<boolean>(false);
   const [serverBotState, setServerBotState] = useState<ServerBotState | null>(null);
@@ -337,6 +339,8 @@ export default function App() {
   xauMtfCandlesRef.current = xauMtfCandles;
   const goldMacroRef = useRef(goldMacro);
   goldMacroRef.current = goldMacro;
+  const institutionalGoldRef = useRef(institutionalGold);
+  institutionalGoldRef.current = institutionalGold;
   const calendarSnapshotRef = useRef(calendarSnapshot);
   calendarSnapshotRef.current = calendarSnapshot;
   const server247EnabledRef = useRef(server247Enabled);
@@ -1179,6 +1183,7 @@ export default function App() {
                 {
                   mtfCandles: xauMtfCandlesRef.current,
                   macro: goldMacroRef.current,
+                  institutional: institutionalGoldRef.current,
                   calendar: calendarSnapshotRef.current,
                   nowMs,
                 },
@@ -1466,6 +1471,7 @@ export default function App() {
       {
         mtfCandles: xauMtfCandles,
         macro: goldMacro,
+        institutional: institutionalGold,
         calendar: calendarSnapshot,
       },
     );
@@ -1480,6 +1486,7 @@ export default function App() {
     pendingOrders,
     xauMtfCandles,
     goldMacro,
+    institutionalGold,
     calendarSnapshot,
   ]);
 
@@ -1614,6 +1621,19 @@ export default function App() {
       }
     };
 
+    const fetchInstitutional = async () => {
+      try {
+        const res = await fetch('/api/institutional/gold');
+        if (!res.ok) return;
+        const data = (await res.json()) as InstitutionalGoldContext;
+        if (!cancelled && typeof data.compositeScore === 'number') {
+          setInstitutionalGold(data);
+        }
+      } catch {
+        // Ignore transient errors
+      }
+    };
+
     const fetchCalendar = async () => {
       try {
         const before = xauBotConfigRef.current.newsPauseMinutesBefore ?? 15;
@@ -1631,15 +1651,18 @@ export default function App() {
 
     fetchMtf();
     fetchMacro();
+    fetchInstitutional();
     fetchCalendar();
     const mtfTimer = setInterval(fetchMtf, 30_000);
     const macroTimer = setInterval(fetchMacro, 8_000);
+    const instTimer = setInterval(fetchInstitutional, 8_000);
     const calTimer = setInterval(fetchCalendar, 60_000);
 
     return () => {
       cancelled = true;
       clearInterval(mtfTimer);
       clearInterval(macroTimer);
+      clearInterval(instTimer);
       clearInterval(calTimer);
     };
   }, [isOnline]);
@@ -1886,8 +1909,11 @@ export default function App() {
       candles,
       recentPrints,
       pendingOrders,
+      selectedInstrument.symbol === 'XAU/USD' || selectedInstrument.symbol === 'GC1!'
+        ? institutionalGold
+        : null,
     );
-  }, [selectedInstrument, candles, recentPrints, pendingOrders]);
+  }, [selectedInstrument, candles, recentPrints, pendingOrders, institutionalGold]);
 
   // Live Account Metrics
   const unrealizedPnl = useMemo(() => {
@@ -2819,6 +2845,12 @@ export default function App() {
                     <OrderFlowPanel
                       instrument={selectedInstrument}
                       snapshot={orderFlowSnapshot}
+                      institutional={
+                        selectedInstrument.symbol === 'XAU/USD' ||
+                        selectedInstrument.symbol === 'GC1!'
+                          ? institutionalGold
+                          : null
+                      }
                       onStageOrder={(preset) => {
                         setStagedOrderPreset(preset);
                         setMobileTradePanel('ORDER');

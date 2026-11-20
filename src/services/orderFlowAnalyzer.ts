@@ -5,7 +5,10 @@ import {
   formatPrice,
 } from './tradingMath';
 import type {
+  BarDeltaPoint,
   Candle,
+  FootprintClusterRow,
+  InstitutionalGoldContext,
   Instrument,
   LiquidityZone,
   MarketPrint,
@@ -42,41 +45,67 @@ export function analyzeOrderFlow(
   candles: Candle[],
   recentPrints: MarketPrint[],
   userPendingOrders: PendingOrder[],
+  institutional?: InstitutionalGoldContext | null,
 ): OrderFlowSnapshot | null {
   if (!candles || candles.length < 20) return null;
 
   const recentBars = candles.slice(-60);
   const lastIdx = recentBars.length - 1;
   const dec = instrument.decimals;
+  const isGoldSymbol = instrument.symbol === 'XAU/USD' || instrument.symbol === 'GC1!';
 
-  // 1. Buy vs Sell Volume Pressure & CVD across last 24 bars
+  // 1. Buy vs Sell Volume Pressure, Bar-by-Bar Delta & CVD across last 24 bars
   const deltaBars = recentBars.slice(-24);
   let buyVolSum = 0;
   let sellVolSum = 0;
   let cvd = 0;
+  const barDeltas: BarDeltaPoint[] = [];
 
-  for (const bar of deltaBars) {
+  for (let i = 0; i < deltaBars.length; i++) {
+    const bar = deltaBars[i];
     const range = Math.max(instrument.tickSize, bar.high - bar.low);
-    // Close Location Value mapped [0..1] for buy share
     const buyShare = Math.max(0.1, Math.min(0.9, (bar.close - bar.low) / range));
     const vol = Math.max(1, bar.volume || 1);
-    const bVol = vol * buyShare;
-    const sVol = vol * (1 - buyShare);
+    let bVol = vol * buyShare;
+    let sVol = vol * (1 - buyShare);
+
+    // On the active bar, blend live executed PAXG/Kraken aggressor share when available
+    if (i === deltaBars.length - 1 && isGoldSymbol && institutional && institutional.paxgBuyVolumeOz + institutional.paxgSellVolumeOz > 0) {
+      const paxgShare = institutional.paxgBuyPct / 100;
+      const blendedShare = buyShare * 0.55 + paxgShare * 0.45;
+      bVol = vol * blendedShare;
+      sVol = vol * (1 - blendedShare);
+    }
+
+    const barDelta = bVol - sVol;
     buyVolSum += bVol;
     sellVolSum += sVol;
-    cvd += bVol - sVol;
+    cvd += barDelta;
+    if (i >= deltaBars.length - 12) {
+      barDeltas.push({
+        time: bar.time,
+        delta: Math.round(barDelta),
+        cvd: Math.round(cvd),
+        buyVolume: Math.round(bVol),
+        sellVolume: Math.round(sVol),
+        totalVolume: Math.round(vol),
+      });
+    }
   }
 
   const totalBarVol = Math.max(1, buyVolSum + sellVolSum);
   let buyPressurePct = (buyVolSum / totalBarVol) * 100;
 
-  // Blend in live tick / trade tape delta if prints exist
+  // Blend in live tick / trade tape delta + PAXG real executed Gold flow
   const tickBuyCount = recentPrints.filter((p) => p.side === 'BUY').length;
   const tickSellCount = recentPrints.filter((p) => p.side === 'SELL').length;
   const totalPrints = tickBuyCount + tickSellCount;
   if (totalPrints >= 4) {
     const tapeBuyPct = (tickBuyCount / totalPrints) * 100;
     buyPressurePct = buyPressurePct * 0.7 + tapeBuyPct * 0.3;
+  }
+  if (isGoldSymbol && institutional && institutional.paxgBuyVolumeOz + institutional.paxgSellVolumeOz > 0) {
+    buyPressurePct = buyPressurePct * 0.75 + institutional.paxgBuyPct * 0.25;
   }
   buyPressurePct = Math.round(Math.max(5, Math.min(95, buyPressurePct)));
   const sellPressurePct = 100 - buyPressurePct;
@@ -308,7 +337,115 @@ export function analyzeOrderFlow(
 
   liquidityZones.sort((a, b) => b.price - a.price);
 
-  // 6. Technical Confluence Score (EMA9/21 + VWAP + RSI + Volume Delta + Book)
+  // 5b. ATAS-Style Footprint Price Clusters (Bid x Ask per cluster over recent 4 bars + live tape)
+  const clusterBars = recentBars.slice(-4);
+  const cLow = Math.min(...clusterBars.map((b) => b.low));
+  const cHigh = Math.max(...clusterBars.map((b) => b.high));
+  const cSpan = Math.max(instrument.tickSize * 10, cHigh - cLow);
+  const clusterCount = 10;
+  const cStep = cSpan / clusterCount;
+
+  const rawClusters: FootprintClusterRow[] = Array.from({length: clusterCount}, (_, i) => {
+    const pLow = cLow + i * cStep;
+    const pHigh = pLow + cStep;
+    return {
+      priceLow: roundDecimals(pLow, dec),
+      priceHigh: roundDecimals(pHigh, dec),
+      priceMid: roundDecimals((pLow + pHigh) / 2, dec),
+      bidVolume: 0,
+      askVolume: 0,
+      delta: 0,
+      totalVolume: 0,
+      imbalance: 'NONE',
+      isBarPoc: false,
+    };
+  });
+
+  for (const bar of clusterBars) {
+    const vol = Math.max(10, bar.volume || 10);
+    const bodyBullish = bar.close >= bar.open;
+    const loIdx = Math.max(0, Math.min(clusterCount - 1, Math.floor((bar.low - cLow) / cStep)));
+    const hiIdx = Math.max(loIdx, Math.min(clusterCount - 1, Math.floor((bar.high - cLow) / cStep)));
+    const levels = hiIdx - loIdx + 1;
+    const perLevel = vol / levels;
+    for (let li = loIdx; li <= hiIdx; li++) {
+      const posFrac = levels > 1 ? (li - loIdx) / (levels - 1) : 0.5;
+      // Upper ticks carry aggressive ask-lifting in bullish bars; lower ticks carry bid-hitting in bearish bars
+      const askRatio = bodyBullish
+        ? Math.min(0.84, Math.max(0.25, 0.48 + posFrac * 0.34))
+        : Math.min(0.75, Math.max(0.16, 0.22 + posFrac * 0.32));
+      rawClusters[li].askVolume += perLevel * askRatio;
+      rawClusters[li].bidVolume += perLevel * (1 - askRatio);
+    }
+  }
+
+  for (const print of recentPrints.slice(0, 40)) {
+    const idx = Math.max(0, Math.min(clusterCount - 1, Math.floor((print.price - cLow) / cStep)));
+    const weight = Math.max(2, print.size * 25);
+    if (print.side === 'BUY') rawClusters[idx].askVolume += weight;
+    else rawClusters[idx].bidVolume += weight;
+  }
+
+  let maxClusterVol = 0;
+  let barPocIdx = 0;
+  for (let i = 0; i < rawClusters.length; i++) {
+    const row = rawClusters[i];
+    row.bidVolume = Math.round(row.bidVolume);
+    row.askVolume = Math.round(row.askVolume);
+    row.delta = row.askVolume - row.bidVolume;
+    row.totalVolume = row.askVolume + row.bidVolume;
+    if (row.askVolume >= Math.max(10, row.bidVolume * 2.4)) {
+      row.imbalance = 'BUY';
+    } else if (row.bidVolume >= Math.max(10, row.askVolume * 2.4)) {
+      row.imbalance = 'SELL';
+    }
+    if (row.totalVolume > maxClusterVol) {
+      maxClusterVol = row.totalVolume;
+      barPocIdx = i;
+    }
+  }
+  rawClusters[barPocIdx].isBarPoc = true;
+
+  // Detect 2+ consecutive Bid or Ask imbalances (ATAS Stacked Imbalance)
+  let stackedImbalance: OrderFlowSnapshot['stackedImbalance'] = 'NONE';
+  let buyRun = 0;
+  let sellRun = 0;
+  for (const row of rawClusters) {
+    if (row.imbalance === 'BUY') {
+      buyRun += 1;
+      sellRun = 0;
+    } else if (row.imbalance === 'SELL') {
+      sellRun += 1;
+      buyRun = 0;
+    } else {
+      buyRun = 0;
+      sellRun = 0;
+    }
+    if (buyRun >= 2) stackedImbalance = 'BULLISH_STACK';
+    if (sellRun >= 2) stackedImbalance = 'BEARISH_STACK';
+  }
+
+  // Detect CVD Divergence & Passive Absorption (price stalls/reverses against delta)
+  let cvdDivergence: OrderFlowSnapshot['cvdDivergence'] = 'NONE';
+  let absorptionSignal: OrderFlowSnapshot['absorptionSignal'] = 'NONE';
+  if (barDeltas.length >= 5) {
+    const recentSlice = recentBars.slice(-5);
+    const priceChange = recentSlice[recentSlice.length - 1].close - recentSlice[0].close;
+    const cvdChange = barDeltas[barDeltas.length - 1].cvd - barDeltas[barDeltas.length - 5].cvd;
+    if (priceChange <= 0 && cvdChange > 0 && buyPressurePct >= 52) {
+      cvdDivergence = 'BULLISH';
+      if (instrument.price <= pocPrice + atr14 * 0.25) {
+        absorptionSignal = 'BULLISH_ABSORPTION';
+      }
+    } else if (priceChange >= 0 && cvdChange < 0 && sellPressurePct >= 52) {
+      cvdDivergence = 'BEARISH';
+      if (instrument.price >= pocPrice - atr14 * 0.25) {
+        absorptionSignal = 'BEARISH_ABSORPTION';
+      }
+    }
+  }
+
+  // 6. Technical Confluence Score (EMA9/21 + VWAP + RSI + Volume Delta + Book + ATAS Imbalance/Absorption)
   const ema9Arr = calculateEMA(recentBars, 9);
   const ema21Arr = calculateEMA(recentBars, 21);
   const vwapArr = calculateVWAP(recentBars);
@@ -320,20 +457,26 @@ export function analyzeOrderFlow(
   const rsi14 = rsiArr[lastIdx] ?? 50;
 
   let score = 50;
-  if (ema9 > ema21) score += 12;
-  else score -= 12;
+  if (ema9 > ema21) score += 11;
+  else score -= 11;
 
-  if (instrument.price > vwap) score += 10;
-  else score -= 10;
+  if (instrument.price > vwap) score += 9;
+  else score -= 9;
 
-  if (buyPressurePct >= 56) score += 12;
-  else if (buyPressurePct <= 44) score -= 12;
+  if (buyPressurePct >= 56) score += 11;
+  else if (buyPressurePct <= 44) score -= 11;
 
-  if (bookImbalancePct >= 56) score += 8;
-  else if (bookImbalancePct <= 44) score -= 8;
+  if (bookImbalancePct >= 56) score += 7;
+  else if (bookImbalancePct <= 44) score -= 7;
 
-  if (rsi14 >= 52 && rsi14 <= 68) score += 8;
-  else if (rsi14 <= 48 && rsi14 >= 32) score -= 8;
+  if (stackedImbalance === 'BULLISH_STACK') score += 6;
+  else if (stackedImbalance === 'BEARISH_STACK') score -= 6;
+
+  if (absorptionSignal === 'BULLISH_ABSORPTION' || cvdDivergence === 'BULLISH') score += 5;
+  else if (absorptionSignal === 'BEARISH_ABSORPTION' || cvdDivergence === 'BEARISH') score -= 5;
+
+  if (rsi14 >= 52 && rsi14 <= 68) score += 7;
+  else if (rsi14 <= 48 && rsi14 >= 32) score -= 7;
 
   score = Math.max(5, Math.min(95, Math.round(score)));
   const verdict: OrderFlowSnapshot['verdict'] =
@@ -426,6 +569,11 @@ export function analyzeOrderFlow(
     vahPrice: roundDecimals(vahPrice, dec),
     valPrice: roundDecimals(valPrice, dec),
     volumeProfile: [...rawBins].reverse(), // highest price at top
+    footprintClusters: [...rawClusters].reverse(),
+    barDeltas,
+    stackedImbalance,
+    absorptionSignal,
+    cvdDivergence,
     liquidityZones,
     verdict,
     verdictScore: score,

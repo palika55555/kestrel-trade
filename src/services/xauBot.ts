@@ -12,6 +12,7 @@ import type {
   Candle,
   EconomicCalendarSnapshot,
   EconomicEvent,
+  InstitutionalGoldContext,
   Instrument,
   MacroGoldContext,
   MarketPrint,
@@ -306,6 +307,12 @@ export interface XauBotEvaluation {
   mtfTrends: MtfTimeframeTrend[];
   mtfBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   macro: MacroGoldContext | null;
+  institutional: InstitutionalGoldContext | null;
+  atasSignals: {
+    stackedImbalance: string;
+    absorptionSignal: string;
+    cvdDivergence: string;
+  } | null;
   sessionInfo: SessionSpreadInfo;
   newsStatus: {
     blocked: boolean;
@@ -330,6 +337,7 @@ export function evaluateXauBotSignal(
   context?: {
     mtfCandles?: Partial<Record<Timeframe, Candle[]>>;
     macro?: MacroGoldContext | null;
+    institutional?: InstitutionalGoldContext | null;
     calendar?: EconomicCalendarSnapshot | null;
     nowMs?: number;
   },
@@ -355,7 +363,14 @@ export function evaluateXauBotSignal(
   const bbLower = bb.lower[idx] ?? instrument.price - 10;
 
   const orb = analyzeORB(instrument, candles, orbWindowMinutes);
-  const flow = analyzeOrderFlow(instrument, candles, recentPrints, pendingOrders);
+  const instCtx = context?.institutional ?? null;
+  const flow = analyzeOrderFlow(
+    instrument,
+    candles,
+    recentPrints,
+    pendingOrders,
+    instCtx,
+  );
 
   let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
   let confidence = 40;
@@ -557,6 +572,72 @@ export function evaluateXauBotSignal(
     }
   }
 
+  // 3b. ATAS Footprint / Absorption / Divergence + Institutional Smart Money Gate
+  if (flow && useOrderFlow && action !== 'HOLD') {
+    if (
+      (action === 'BUY' && flow.stackedImbalance === 'BULLISH_STACK') ||
+      (action === 'SELL' && flow.stackedImbalance === 'BEARISH_STACK')
+    ) {
+      confidence = Math.min(98, confidence + 4);
+      reason = `${reason} · ATAS Stack`;
+    } else if (
+      (action === 'BUY' && flow.stackedImbalance === 'BEARISH_STACK') ||
+      (action === 'SELL' && flow.stackedImbalance === 'BULLISH_STACK')
+    ) {
+      confidence = Math.max(18, confidence - 8);
+      reason = `${reason} · Opposing Stack`;
+    }
+
+    if (
+      (action === 'BUY' &&
+        (flow.absorptionSignal === 'BULLISH_ABSORPTION' || flow.cvdDivergence === 'BULLISH')) ||
+      (action === 'SELL' &&
+        (flow.absorptionSignal === 'BEARISH_ABSORPTION' || flow.cvdDivergence === 'BEARISH'))
+    ) {
+      confidence = Math.min(98, confidence + 4);
+      reason = `${reason} · ${flow.absorptionSignal !== 'NONE' ? 'Absorption' : 'CVD Div'}`;
+    } else if (
+      (action === 'BUY' &&
+        (flow.absorptionSignal === 'BEARISH_ABSORPTION' || flow.cvdDivergence === 'BEARISH')) ||
+      (action === 'SELL' &&
+        (flow.absorptionSignal === 'BULLISH_ABSORPTION' || flow.cvdDivergence === 'BULLISH'))
+    ) {
+      confidence = Math.max(18, confidence - 6);
+      reason = `${reason} · Flow Divergence Risk`;
+    }
+  }
+
+  if (instCtx && useOrderFlow && action !== 'HOLD') {
+    if (action === 'BUY' && instCtx.paxgBuyPct >= 58 && instCtx.paxgBookBidPct >= 52) {
+      confidence = Math.min(98, confidence + 6);
+      reason = `${reason} · PAXG + (${instCtx.paxgBuyPct}% Buy)`;
+    } else if (action === 'BUY' && instCtx.paxgBuyPct <= 38 && instCtx.paxgBookBidPct <= 44) {
+      confidence = Math.max(18, confidence - 9);
+      reason = `${reason} · PAXG Seller pressure`;
+    } else if (action === 'SELL' && instCtx.paxgBuyPct <= 42 && instCtx.paxgBookBidPct <= 48) {
+      confidence = Math.min(98, confidence + 6);
+      reason = `${reason} · PAXG + (${100 - instCtx.paxgBuyPct}% Sell)`;
+    } else if (action === 'SELL' && instCtx.paxgBuyPct >= 62 && instCtx.paxgBookBidPct >= 56) {
+      confidence = Math.max(18, confidence - 9);
+      reason = `${reason} · PAXG Buyer pressure`;
+    }
+  }
+
+  if (instCtx && useMacro && action !== 'HOLD') {
+    if (
+      (action === 'BUY' && instCtx.compositeBias === 'BULLISH') ||
+      (action === 'SELL' && instCtx.compositeBias === 'BEARISH')
+    ) {
+      confidence = Math.min(98, confidence + 4);
+      reason = `${reason} · Insider +`;
+    } else if (
+      (action === 'BUY' && instCtx.compositeBias === 'BEARISH') ||
+      (action === 'SELL' && instCtx.compositeBias === 'BULLISH')
+    ) {
+      confidence = Math.max(18, confidence - 4);
+    }
+  }
+
   // 4. Session & Spread Guard (blocks wide spreads / adjusts session quality)
   if (useSessionGuard && action !== 'HOLD') {
     if (!sessionInfo.spreadOk) {
@@ -621,8 +702,14 @@ export function evaluateXauBotSignal(
     confidence = Math.min(confidence, 35);
   }
 
-  if (confidence < config.minConfidence && action !== 'HOLD') {
-    reason = `Signal suppressed (${confidence}% < min ${config.minConfidence}%): ${reason}`;
+  const effectiveMinConf = instCtx?.volatilityAlert
+    ? Math.min(90, config.minConfidence + 5)
+    : config.minConfidence;
+
+  if (confidence < effectiveMinConf && action !== 'HOLD') {
+    reason = `Signal suppressed (${confidence}% < min ${effectiveMinConf}%${
+      instCtx?.volatilityAlert ? ' GVZ spike' : ''
+    }): ${reason}`;
     action = 'HOLD';
   }
 
@@ -671,6 +758,14 @@ export function evaluateXauBotSignal(
     mtfTrends,
     mtfBias,
     macro,
+    institutional: instCtx,
+    atasSignals: flow
+      ? {
+          stackedImbalance: flow.stackedImbalance,
+          absorptionSignal: flow.absorptionSignal,
+          cvdDivergence: flow.cvdDivergence,
+        }
+      : null,
     sessionInfo,
     newsStatus: {
       blocked: newsBlocked,

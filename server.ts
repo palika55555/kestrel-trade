@@ -6,11 +6,14 @@ import type {
   BrokerProvider,
   BrokerStatus,
   Candle,
+  CotPositioning,
   EconomicCalendarSnapshot,
   EconomicEvent,
+  InstitutionalGoldContext,
   Instrument,
   MarketPrint,
   OrderBookLevel,
+  OrderSide,
   Position,
   ServerBotState,
   Timeframe,
@@ -572,6 +575,47 @@ class LiveMarketEngine {
   private brokerOrderInFlight = false;
   private swissquoteInFlight = false;
   private yahooInFlight = false;
+  private cotPositioning: CotPositioning | null = null;
+  private instFlowLastPollAt = 0;
+  private instFlow: {
+    gvz: number | null;
+    gvzChangePct: number;
+    vix: number | null;
+    vixChangePct: number;
+    gldPrice: number | null;
+    gldChangePct: number;
+    gldVolume: number;
+    paxgPrice: number | null;
+    paxgBuyVolumeOz: number;
+    paxgSellVolumeOz: number;
+    paxgNetDeltaOz: number;
+    paxgBuyPct: number;
+    paxgBookBidPct: number;
+    paxgLargePrints: Array<{
+      id: string;
+      price: number;
+      sizeOz: number;
+      side: OrderSide;
+      timestamp: number;
+    }>;
+    updatedAt: number;
+  } = {
+    gvz: null,
+    gvzChangePct: 0,
+    vix: null,
+    vixChangePct: 0,
+    gldPrice: null,
+    gldChangePct: 0,
+    gldVolume: 0,
+    paxgPrice: null,
+    paxgBuyVolumeOz: 0,
+    paxgSellVolumeOz: 0,
+    paxgNetDeltaOz: 0,
+    paxgBuyPct: 50,
+    paxgBookBidPct: 50,
+    paxgLargePrints: [],
+    updatedAt: 0,
+  };
   private brokerCache: {
     balance: number | null;
     equity: number | null;
@@ -650,10 +694,12 @@ class LiveMarketEngine {
     this.pollYahooQuotes();
     this.preloadInitialCandles();
     this.fetchEconomicCalendar();
+    this.fetchCftcCot();
 
     setInterval(() => this.pollSwissquoteAndKraken(), 2000);
     setInterval(() => this.pollYahooQuotes(), 4000);
     setInterval(() => this.fetchEconomicCalendar(), 15 * 60_000);
+    setInterval(() => this.fetchCftcCot(), 6 * 3600_000);
   }
 
   private loadServerBotState() {
@@ -765,6 +811,56 @@ class LiveMarketEngine {
     if (events.length > 0) {
       this.calendarEvents = events.sort((a, b) => a.timestamp - b.timestamp);
       this.calendarUpdatedAt = Date.now();
+    }
+  }
+
+  async fetchCftcCot() {
+    try {
+      const rows = await fetchJsonWithTimeout<Array<Record<string, string>>>(
+        'https://publicreporting.cftc.gov/resource/72hh-3qpy.json?cftc_contract_market_code=088691&$order=report_date_as_yyyy_mm_dd%20DESC&$limit=2',
+        7000,
+      );
+      if (!Array.isArray(rows) || rows.length === 0) return;
+      const latest = rows[0];
+      const prev = rows[1];
+      const num = (r: Record<string, string> | undefined, k: string) =>
+        Number(r?.[k] || 0) || 0;
+
+      const mmLong = num(latest, 'm_money_positions_long_all');
+      const mmShort = num(latest, 'm_money_positions_short_all');
+      const mmNet = mmLong - mmShort;
+      const prevMmNet = prev
+        ? num(prev, 'm_money_positions_long_all') - num(prev, 'm_money_positions_short_all')
+        : mmNet;
+      const mmChange = mmNet - prevMmNet;
+
+      const commNet =
+        num(latest, 'prod_merc_positions_long') - num(latest, 'prod_merc_positions_short');
+      const swapNet =
+        num(latest, 'swap_positions_long_all') - num(latest, 'swap__positions_short_all');
+      const retailNet =
+        num(latest, 'nonrept_positions_long_all') - num(latest, 'nonrept_positions_short_all');
+      const oi = num(latest, 'open_interest_all');
+
+      let bias: CotPositioning['bias'] = 'NEUTRAL';
+      if (mmNet > 40_000 && mmChange >= -5_000) bias = 'BULLISH';
+      else if (mmNet < 10_000 || mmChange <= -15_000) bias = 'BEARISH';
+
+      this.cotPositioning = {
+        marketName: latest.market_and_exchange_names || 'COMEX GOLD',
+        reportDate: (latest.report_date_as_yyyy_mm_dd || '').slice(0, 10),
+        openInterest: oi,
+        managedMoneyLong: mmLong,
+        managedMoneyShort: mmShort,
+        managedMoneyNet: mmNet,
+        managedMoneyNetChange: mmChange,
+        commercialNet: commNet,
+        swapDealerNet: swapNet,
+        retailNet,
+        bias,
+      };
+    } catch {
+      // Ignore transient CFTC errors
     }
   }
 
@@ -1055,6 +1151,71 @@ class LiveMarketEngine {
           feedStatus: 'LIVE',
         });
       })(),
+      // Real executed Gold Order Flow & Depth via Kraken PAXG/USD (1:1 tokenized physical gold)
+      (async () => {
+        const [paxgTrades, paxgDepth] = await Promise.all([
+          fetchJsonWithTimeout<KrakenTradesResponse>(
+            'https://api.kraken.com/0/public/Trades?pair=PAXGUSD&count=60',
+            3500,
+          ),
+          fetchJsonWithTimeout<KrakenDepthResponse>(
+            'https://api.kraken.com/0/public/Depth?pair=PAXGUSD&count=15',
+            3500,
+          ),
+        ]);
+
+        const trKey = paxgTrades?.result
+          ? Object.keys(paxgTrades.result).find((k) => k !== 'last')
+          : undefined;
+        const rows = trKey ? paxgTrades?.result?.[trKey] : undefined;
+        if (rows && rows.length > 0) {
+          let buyOz = 0;
+          let sellOz = 0;
+          let latestPx = this.instFlow.paxgPrice;
+          const large: typeof this.instFlow.paxgLargePrints = [];
+
+          for (const row of rows.slice(-60)) {
+            const px = parseFloat(row[0]);
+            const sz = parseFloat(row[1]);
+            const ts = Math.round(row[2] * 1000);
+            const side: OrderSide = row[3] === 'b' ? 'BUY' : 'SELL';
+            if (!Number.isFinite(px) || !Number.isFinite(sz)) continue;
+            latestPx = roundToDecimals(px, 2);
+            if (side === 'BUY') buyOz += sz;
+            else sellOz += sz;
+            if (sz >= 0.2) {
+              large.push({
+                id: `paxg-${ts}-${Math.round(sz * 1000)}`,
+                price: latestPx,
+                sizeOz: Number(sz.toFixed(3)),
+                side,
+                timestamp: ts,
+              });
+            }
+          }
+
+          const totalOz = buyOz + sellOz;
+          this.instFlow.paxgPrice = latestPx;
+          this.instFlow.paxgBuyVolumeOz = Number(buyOz.toFixed(2));
+          this.instFlow.paxgSellVolumeOz = Number(sellOz.toFixed(2));
+          this.instFlow.paxgNetDeltaOz = Number((buyOz - sellOz).toFixed(2));
+          this.instFlow.paxgBuyPct = totalOz > 0 ? Math.round((buyOz / totalOz) * 100) : 50;
+          this.instFlow.paxgLargePrints = large.reverse().slice(0, 8);
+          this.instFlow.updatedAt = Date.now();
+        }
+
+        const dKey = paxgDepth?.result ? Object.keys(paxgDepth.result)[0] : undefined;
+        const depth = dKey ? paxgDepth?.result?.[dKey] : undefined;
+        if (depth) {
+          const bidSum = depth.bids.slice(0, 12).reduce((a, r) => a + (parseFloat(r[1]) || 0), 0);
+          const askSum = depth.asks.slice(0, 12).reduce((a, r) => a + (parseFloat(r[1]) || 0), 0);
+          const tot = bidSum + askSum;
+          if (tot > 0) {
+            this.instFlow.paxgBookBidPct = Math.round((bidSum / tot) * 100);
+            this.instFlow.updatedAt = Date.now();
+          }
+        }
+      })(),
     ]);
 
     try {
@@ -1313,7 +1474,30 @@ class LiveMarketEngine {
             else if ((action === 'BUY' && macro.macroBias === 'BEARISH') || (action === 'SELL' && macro.macroBias === 'BULLISH')) conf -= 8;
           }
 
-          if (action !== 'HOLD' && conf >= cfg.minConfidence) {
+          // Institutional Gold Flow & ATAS Aggressor Filter (PAXG real trades + GVZ volatility + COT/GLD)
+          const instCtx = this.getInstitutionalGold();
+          if (action !== 'HOLD' && (cfg.useOrderFlowConfluence ?? true)) {
+            if (action === 'BUY' && instCtx.paxgBuyPct >= 58 && instCtx.paxgBookBidPct >= 52) {
+              conf += 6;
+            } else if (action === 'BUY' && instCtx.paxgBuyPct <= 38 && instCtx.paxgBookBidPct <= 44) {
+              conf -= 9;
+            } else if (action === 'SELL' && instCtx.paxgBuyPct <= 42 && instCtx.paxgBookBidPct <= 48) {
+              conf += 6;
+            } else if (action === 'SELL' && instCtx.paxgBuyPct >= 62 && instCtx.paxgBookBidPct >= 56) {
+              conf -= 9;
+            }
+          }
+          if (action !== 'HOLD' && (cfg.useMacroConfluence ?? true)) {
+            if ((action === 'BUY' && instCtx.compositeBias === 'BULLISH') || (action === 'SELL' && instCtx.compositeBias === 'BEARISH')) {
+              conf += 4;
+            } else if ((action === 'BUY' && instCtx.compositeBias === 'BEARISH') || (action === 'SELL' && instCtx.compositeBias === 'BULLISH')) {
+              conf -= 4;
+            }
+          }
+
+          const effectiveMinConf = instCtx.volatilityAlert ? Math.min(90, cfg.minConfidence + 5) : cfg.minConfidence;
+
+          if (action !== 'HOLD' && conf >= effectiveMinConf) {
             const fill = action === 'BUY' ? xau.ask : xau.bid;
             const sameSide = this.serverBot.positions.filter((p) => p.side === action);
             const closestDist = sameSide.length > 0 ? Math.min(...sameSide.map((p) => Math.abs(p.entryPrice - fill))) : 999;
@@ -2207,6 +2391,45 @@ class LiveMarketEngine {
           this.macroGold.live = true;
         }
       })(),
+      // CBOE Gold Volatility (^GVZ), ^VIX & SPDR Gold ETF (GLD) institutional flow (throttled every ~15s)
+      (async () => {
+        if (Date.now() - this.instFlowLastPollAt < 15_000) return;
+        this.instFlowLastPollAt = Date.now();
+        const [gvzRes, vixRes, gldRes] = await Promise.all([
+          fetchJsonWithTimeout<YahooChartResponse>(
+            'https://query1.finance.yahoo.com/v8/finance/chart/%5EGVZ?range=1d&interval=5m',
+            4500,
+          ),
+          fetchJsonWithTimeout<YahooChartResponse>(
+            'https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?range=1d&interval=5m',
+            4500,
+          ),
+          fetchJsonWithTimeout<YahooChartResponse>(
+            'https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=5m',
+            4500,
+          ),
+        ]);
+        const gvzMeta = gvzRes?.chart?.result?.[0]?.meta;
+        if (gvzMeta?.regularMarketPrice) {
+          const prev = gvzMeta.chartPreviousClose || gvzMeta.previousClose || gvzMeta.regularMarketPrice;
+          this.instFlow.gvz = roundToDecimals(gvzMeta.regularMarketPrice, 2);
+          this.instFlow.gvzChangePct = prev > 0 ? roundToDecimals(((gvzMeta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
+        }
+        const vixMeta = vixRes?.chart?.result?.[0]?.meta;
+        if (vixMeta?.regularMarketPrice) {
+          const prev = vixMeta.chartPreviousClose || vixMeta.previousClose || vixMeta.regularMarketPrice;
+          this.instFlow.vix = roundToDecimals(vixMeta.regularMarketPrice, 2);
+          this.instFlow.vixChangePct = prev > 0 ? roundToDecimals(((vixMeta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
+        }
+        const gldMeta = gldRes?.chart?.result?.[0]?.meta;
+        if (gldMeta?.regularMarketPrice) {
+          const prev = gldMeta.chartPreviousClose || gldMeta.previousClose || gldMeta.regularMarketPrice;
+          this.instFlow.gldPrice = roundToDecimals(gldMeta.regularMarketPrice, 2);
+          this.instFlow.gldChangePct = prev > 0 ? roundToDecimals(((gldMeta.regularMarketPrice - prev) / prev) * 100, 2) : 0;
+          this.instFlow.gldVolume = Math.round(gldMeta.regularMarketVolume || 0);
+        }
+        this.instFlow.updatedAt = Date.now();
+      })(),
     ]);
 
       this.broadcastTick();
@@ -2388,6 +2611,75 @@ class LiveMarketEngine {
     };
   }
 
+  getInstitutionalGold(): InstitutionalGoldContext {
+    let score = 0;
+    const notes: string[] = [];
+
+    if (this.cotPositioning) {
+      if (this.cotPositioning.bias === 'BULLISH') {
+        score += 3;
+        notes.push(`COT Funds Net +${this.cotPositioning.managedMoneyNet.toLocaleString()}`);
+      } else if (this.cotPositioning.bias === 'BEARISH') {
+        score -= 3;
+        notes.push(`COT Funds trimming (${this.cotPositioning.managedMoneyNetChange.toLocaleString()} WoW)`);
+      }
+    }
+
+    if (this.instFlow.gldPrice !== null) {
+      if (this.instFlow.gldChangePct >= 0.25) {
+        score += 3;
+        notes.push(`GLD +${this.instFlow.gldChangePct}%`);
+      } else if (this.instFlow.gldChangePct <= -0.25) {
+        score -= 3;
+        notes.push(`GLD ${this.instFlow.gldChangePct}%`);
+      }
+    }
+
+    if (this.instFlow.paxgBuyVolumeOz + this.instFlow.paxgSellVolumeOz > 0) {
+      if (this.instFlow.paxgBuyPct >= 56) {
+        score += 3;
+        notes.push(`PAXG Flow ${this.instFlow.paxgBuyPct}% Buy`);
+      } else if (this.instFlow.paxgBuyPct <= 44) {
+        score -= 3;
+        notes.push(`PAXG Flow ${100 - this.instFlow.paxgBuyPct}% Sell`);
+      }
+    }
+
+    const volatilityAlert = Boolean(
+      (this.instFlow.gvz !== null && this.instFlow.gvz >= 29) ||
+        this.instFlow.gvzChangePct >= 8,
+    );
+    if (volatilityAlert) {
+      notes.push(`GVZ Vol Spike (${this.instFlow.gvz ?? '--'})`);
+    }
+
+    const compositeBias: InstitutionalGoldContext['compositeBias'] =
+      score >= 3 ? 'BULLISH' : score <= -3 ? 'BEARISH' : 'NEUTRAL';
+
+    return {
+      cot: this.cotPositioning,
+      gvz: this.instFlow.gvz,
+      gvzChangePct: this.instFlow.gvzChangePct,
+      vix: this.instFlow.vix,
+      vixChangePct: this.instFlow.vixChangePct,
+      gldPrice: this.instFlow.gldPrice,
+      gldChangePct: this.instFlow.gldChangePct,
+      gldVolume: this.instFlow.gldVolume,
+      paxgPrice: this.instFlow.paxgPrice,
+      paxgBuyVolumeOz: this.instFlow.paxgBuyVolumeOz,
+      paxgSellVolumeOz: this.instFlow.paxgSellVolumeOz,
+      paxgNetDeltaOz: this.instFlow.paxgNetDeltaOz,
+      paxgBuyPct: this.instFlow.paxgBuyPct,
+      paxgBookBidPct: this.instFlow.paxgBookBidPct,
+      paxgLargePrints: this.instFlow.paxgLargePrints,
+      compositeBias,
+      compositeScore: score,
+      volatilityAlert,
+      summary: notes.length > 0 ? notes.join(' · ') : 'Neutral institutional positioning',
+      updatedAt: this.instFlow.updatedAt || Date.now(),
+    };
+  }
+
   addSubscriber(res: express.Response) {
     this.subscribers.add(res);
   }
@@ -2421,6 +2713,10 @@ async function startServer() {
 
   app.get('/api/macro/gold', (_req, res) => {
     res.json(engine.getGoldMacro());
+  });
+
+  app.get('/api/institutional/gold', (_req, res) => {
+    res.json(engine.getInstitutionalGold());
   });
 
   app.get('/api/calendar', (req, res) => {
